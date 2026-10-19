@@ -1,0 +1,48 @@
+{
+  "name": "reeve-api",
+  "private": true,
+  "type": "module",
+  "description": "Backend: HTTP API, Builder, Auditor, pipeline, sandbox, broker, receipts ledger, on-chain anchor and the CLI.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "demo": "tsx apps/cli/src/main.ts demo",
+    "demo:bug": "tsx apps/cli/src/main.ts demo --inject-bug",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:py": "cd runtime && python3 -E -s -m unittest discover -s tests -t .",
+    "demo:live": "tsx --env-file=.env apps/cli/src/main.ts demo --llm=anthropic --sandbox=createos",
+    "demo:createos": "tsx --env-file=.env apps/cli/src/main.ts demo --sandbox=createos",
+    "check:egress": "tsx --env-file=.env apps/cli/src/egress-check.ts",
+    "rails:smoke": "tsx --env-file=.env apps/cli/src/rails-smoke.ts",
+    "anchor:wallet": "tsx apps/cli/src/anchor-wallet.ts",
+    "anchor:now": "tsx --env-file=.env apps/cli/src/anchor-now.ts",
+    "connectors:check": "tsx --env-file=.env apps/cli/src/connectors-check.ts",
+    "connectors:send": "tsx --env-file=.env apps/cli/src/connectors-send.ts",
+    "connectors:read": "tsx --env-file=.env apps/cli/src/connectors-read.ts",
+    "preview:seed": "rm -rf .reeve/preview && tsx apps/api/scripts/seed-preview.ts",
+    "demo:minimarket": "tsx apps/cli/src/main.ts demo --pack=minimarket --llm=fixture",
+    "demo:generic": "tsx apps/cli/src/main.ts demo --pack=bimbel-cerdas --llm=fixture",
+    "demo:minimarket:createos": "tsx --env-file=.env apps/cli/src/main.ts demo --pack=minimarket --llm=fixture --sandbox=createos",
+    "dev": "npm run dev -w @reeve/api"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
+    "zod": "^4.6.7",
+    "@reeve/core": "github:Reeve-Agents/reeve-core#main",
+    "@reeve/connectors": "github:Reeve-Agents/reeve-connectors#main",
+    "@reeve/rails": "github:Reeve-Agents/reeve-payments#main"
+  },
+  "repository": "github:Reeve-Agents/reeve-api"
+}
