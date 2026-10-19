@@ -28,7 +28,7 @@
     "demo:minimarket:createos": "tsx --env-file=.env apps/cli/src/main.ts demo --pack=minimarket --llm=fixture --sandbox=createos",
     "dev": "npm run dev -w @reeve/api",
     "start": "npm run start -w @reeve/api",
-    "runtime:fetch": "[ -f runtime/reeve_runtime/job.py ] || (rm -rf runtime && git clone --depth 1 https://github.com/Reeve-Agents/reeve-runtime runtime)",
+    "runtime:fetch": "[ -f runtime/reeve_runtime/job.py ] || (rm -rf runtime && (git clone -q --depth 1 https://github.com/Reeve-Agents/reeve-runtime runtime || (mkdir -p runtime && curl -sfL https://codeload.github.com/Reeve-Agents/reeve-runtime/tar.gz/refs/heads/main | tar xz --strip-components=1 -C runtime)))",
     "postinstall": "npm run -s runtime:fetch"
   },
   "engines": {
