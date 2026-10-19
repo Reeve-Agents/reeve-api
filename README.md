@@ -226,6 +226,16 @@ packages/anchor   Publishes ledger Merkle roots on a testnet and verifies them
 
 > Running from inside Claude Code? Its shell sets `ANTHROPIC_BASE_URL`; run `env -u ANTHROPIC_BASE_URL npm run demo:live` so the SDK talks to api.anthropic.com with your own key.
 
+## Deploying (CreateOS)
+
+The API runs as a CreateOS project from this repo: install `npm install` (the `postinstall` step fetches
+`runtime/` when the submodule is not checked out), run `npm start`, port `8787`. Set:
+
+- `DATABASE_URL`: a CreateOS Postgres database. The store and the hash-chained ledger live there; keep one replica.
+- `REEVE_WEB_ORIGIN`: the public URL of reeve-web (passkeys are bound to its hostname).
+- `REEVE_SANDBOX=createos` with `CREATEOS_API_KEY` or `CREATEOS_PROJECT_API_KEY`: every job runs in a CreateOS microVM.
+- The parser, rail and connector keys from `.env.example` you want live.
+
 ## Repository layout
 
 This repo is the backend. The Python runtime is the `runtime/` submodule, and shared packages come from

@@ -138,15 +138,37 @@ export type LedgerBody =
  * Each entry commits to the previous entry's hash, so history cannot be rewritten silently.
  * An on-chain anchor (contracts/) will publish the Merkle roots recorded here.
  */
+/** Where ledger entries live: a JSONL file by default, or any store that can list and append (e.g. Postgres). */
+export interface LedgerBackend {
+  entries(): LedgerEntry[];
+  write(entry: LedgerEntry): void;
+}
+
+function fileBackend(path: string): LedgerBackend {
+  return {
+    entries: () =>
+      existsSync(path)
+        ? readFileSync(path, "utf8")
+            .split("\n")
+            .filter(Boolean)
+            .map((l) => JSON.parse(l) as LedgerEntry)
+        : [],
+    write: (entry) => {
+      mkdirSync(dirname(path), { recursive: true });
+      appendFileSync(path, JSON.stringify(entry) + "\n");
+    },
+  };
+}
+
 export class Ledger {
-  constructor(private readonly path: string) {}
+  private readonly backend: LedgerBackend;
+
+  constructor(target: string | LedgerBackend) {
+    this.backend = typeof target === "string" ? fileBackend(target) : target;
+  }
 
   entries(): LedgerEntry[] {
-    if (!existsSync(this.path)) return [];
-    return readFileSync(this.path, "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map((l) => JSON.parse(l) as LedgerEntry);
+    return this.backend.entries();
   }
 
   append(body: LedgerBody): LedgerEntry {
@@ -156,8 +178,7 @@ export class Ledger {
     const seq = last ? last.seq + 1 : 0;
     const withLink = { ...body, seq, prev };
     const entry = { ...withLink, entry_hash: sha256(canonicalJson(withLink)) } as LedgerEntry;
-    mkdirSync(dirname(this.path), { recursive: true });
-    appendFileSync(this.path, JSON.stringify(entry) + "\n");
+    this.backend.write(entry);
     return entry;
   }
 

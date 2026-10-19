@@ -9,6 +9,7 @@ import { connectorsFromEnv, inferFields } from "@reeve/connectors";
 import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv } from "@reeve/sandbox";
 import { createApp } from "./app";
+import { openPostgres } from "./pg";
 import { Store } from "./store";
 
 const home = resolve(repoRoot, process.env.REEVE_HOME ?? ".reeve");
@@ -18,11 +19,16 @@ const origin = process.env.REEVE_WEB_ORIGIN ?? "http://localhost:5173";
 // REEVE_LLM picks the default parser; every other configured one stays selectable per SOP.
 const providers = ProviderRegistry.fromEnv(Object.values(PACK_FIXTURE).map((f) => loadFixtureRulebook(f)));
 
+// DATABASE_URL (a deployment): Store and Ledger live in Postgres. Otherwise files under REEVE_HOME.
+const db = process.env.DATABASE_URL ? await openPostgres(process.env.DATABASE_URL) : null;
+const store = db ? new Store(null, { initial: db.initialStore, persist: db.persistStore }) : new Store(join(home, "db.json"));
+const ledger = new Ledger(db ? db.ledger : join(home, "ledger.jsonl"));
+
 const app = createApp({
-  store: new Store(join(home, "db.json")),
+  store,
   providers,
   sandbox: sandboxFromEnv(),
-  ledger: new Ledger(join(home, "ledger.jsonl")),
+  ledger,
   scenario: (pack: PackId) => (pack === "minimarket" ? minimarketScenario() : kosMelatiScenario()),
   defaultSop: (pack: PackId) => loadFixtureSop(PACK_FIXTURE[pack]),
   // Stripe and Xendit in test mode only (live keys are refused), plus an offline rail.
@@ -41,6 +47,14 @@ const app = createApp({
 
 const ready = providers.list().filter((p) => p.available).map((p) => p.id);
 const rails = railEntries().filter((r) => r.info.available).map((r) => r.info.id);
-serve({ fetch: app.fetch, port }, () => {
-  console.log(`reeve api on http://localhost:${port}/api · default llm ${providers.defaultId} · ${ready.length} parsers ready (${ready.join(", ")}) · rails ${rails.join(", ")} · origin ${origin}`);
+const server = serve({ fetch: app.fetch, port }, () => {
+  console.log(`reeve api on http://localhost:${port}/api · default llm ${providers.defaultId} · ${ready.length} parsers ready (${ready.join(", ")}) · rails ${rails.join(", ")} · origin ${origin} · storage ${db ? "postgres" : home}`);
 });
+
+// On a redeploy, finish the queued Postgres writes before exiting.
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.once(signal, () => {
+    server.close();
+    void (db?.close() ?? Promise.resolve()).finally(() => process.exit(0));
+  });
+}

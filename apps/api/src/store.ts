@@ -81,13 +81,21 @@ export interface StoreData {
   };
 }
 
-/** Small JSON-file store for the MVP (Supabase replaces it later). Writes are atomic (temp file + rename). */
+/** Small document store: a JSON file locally (atomic temp file + rename), or one Postgres row when DATABASE_URL is set. */
 export class Store {
   data: StoreData;
 
-  constructor(private readonly path: string | null) {
-    if (path && existsSync(path)) {
-      this.data = JSON.parse(readFileSync(path, "utf8")) as StoreData;
+  /**
+   * `path` is the JSON file (null keeps everything in memory, for tests). With `persist`, the data
+   * comes from `initial` and every save goes to `persist` instead (the Postgres store in pg.ts).
+   */
+  constructor(
+    private readonly path: string | null,
+    private readonly opts: { initial?: StoreData | null; persist?: (data: StoreData) => void } = {},
+  ) {
+    const loaded = opts.persist ? opts.initial : path && existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as StoreData) : null;
+    if (loaded) {
+      this.data = loaded;
       this.data.operations ??= {};
       this.data.genericOperations ??= {};
       this.data.datasets ??= {};
@@ -116,6 +124,7 @@ export class Store {
   }
 
   save(): void {
+    if (this.opts.persist) return this.opts.persist(this.data);
     if (!this.path) return; // in-memory (tests)
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp`;

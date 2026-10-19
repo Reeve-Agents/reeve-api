@@ -26,14 +26,16 @@
     "demo:minimarket": "tsx apps/cli/src/main.ts demo --pack=minimarket --llm=fixture",
     "demo:generic": "tsx apps/cli/src/main.ts demo --pack=bimbel-cerdas --llm=fixture",
     "demo:minimarket:createos": "tsx --env-file=.env apps/cli/src/main.ts demo --pack=minimarket --llm=fixture --sandbox=createos",
-    "dev": "npm run dev -w @reeve/api"
+    "dev": "npm run dev -w @reeve/api",
+    "start": "npm run start -w @reeve/api",
+    "runtime:fetch": "[ -f runtime/reeve_runtime/job.py ] || (rm -rf runtime && git clone --depth 1 https://github.com/Reeve-Agents/reeve-runtime runtime)",
+    "postinstall": "npm run -s runtime:fetch"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   },
@@ -42,7 +44,8 @@
     "zod": "^4.6.7",
     "@reeve/core": "github:Reeve-Agents/reeve-core#main",
     "@reeve/connectors": "github:Reeve-Agents/reeve-connectors#main",
-    "@reeve/rails": "github:Reeve-Agents/reeve-payments#main"
+    "@reeve/rails": "github:Reeve-Agents/reeve-payments#main",
+    "tsx": "^4.23.15"
   },
   "repository": "github:Reeve-Agents/reeve-api"
 }
