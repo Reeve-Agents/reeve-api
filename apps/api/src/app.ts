@@ -42,6 +42,8 @@ export interface AppDeps {
   apps?: Pick<AppCatalog, "search">;
   /** Publishes ledger Merkle roots on a testnet (proof only). Off when no anchor wallet is set up. */
   anchor?: Pick<ChainAnchor, "chainName" | "chain" | "address" | "anchor" | "verify"> | null;
+  /** Called when the owner adds a passkey here, so the account layer can sign them in with it too. */
+  onPasskeyAdded?: (credentialId: string) => void;
 }
 
 const CHALLENGE_TTL_MS = 5 * 60_000;
@@ -481,6 +483,7 @@ export function createApp(deps: AppDeps) {
     const cred = result.registrationInfo.credential;
     store.data.passkeys.push({ id: cred.id, publicKey: Buffer.from(cred.publicKey).toString("base64url"), counter: cred.counter, transports: cred.transports, createdAt: new Date().toISOString() });
     store.save();
+    deps.onPasskeyAdded?.(cred.id);
     return c.json({ registered: true, count: store.data.passkeys.length });
   });
 
