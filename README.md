@@ -235,6 +235,12 @@ The API runs as a CreateOS project from this repo: install `npm install` (the `p
 - `REEVE_WEB_ORIGIN`: the public URL of reeve-web (passkeys are bound to its hostname).
 - `REEVE_SANDBOX=createos` with `CREATEOS_API_KEY` or `CREATEOS_PROJECT_API_KEY`: every job runs in a CreateOS microVM.
 - The parser, rail and connector keys from `.env.example` you want live.
+- `SUPABASE_URL` and `SUPABASE_SECRET_KEY`: email magic links (the backup sign-in), and `REEVE_SESSION_SECRET` so sessions survive restarts.
+
+On the CreateOS free plan only one app container runs at a time, so a new deployment waits until the old one is
+gone: put the old deployment to sleep in the dashboard (Deployments, the deployment's menu) once the new build is
+ready. Set env vars on the project settings as well as the environment, because a retriggered deployment keeps the
+settings of the one it copies.
 
 ## Repository layout
 
