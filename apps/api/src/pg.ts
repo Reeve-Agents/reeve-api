@@ -3,6 +3,18 @@ import pg from "pg";
 import type { StoreData } from "./store";
 
 /**
+ * Hosted Postgres (Supabase, Neon) asks for TLS with `sslmode=require`. Node does not trust their CA by
+ * default, so the connection is encrypted without verifying the certificate; `sslmode=disable` (or no
+ * sslmode, e.g. a local Docker database) connects without TLS.
+ */
+function connection(url: string): pg.PoolConfig {
+  const u = new URL(url);
+  const mode = u.searchParams.get("sslmode");
+  u.searchParams.delete("sslmode");
+  return { connectionString: u.toString(), ssl: mode && mode !== "disable" ? { rejectUnauthorized: false } : undefined };
+}
+
+/**
  * Postgres persistence for a deployed API (DATABASE_URL). The Store and the Ledger keep their data in
  * memory and stay synchronous; this loads them once at start and writes every change back in order.
  * Run a single replica: two processes would each hold their own copy.
@@ -11,7 +23,7 @@ import type { StoreData } from "./store";
  *   reeve_ledger one row per ledger entry, keyed by seq, so the hash chain is append-only
  */
 export async function openPostgres(url: string) {
-  const pool = new pg.Pool({ connectionString: url, max: 4 });
+  const pool = new pg.Pool({ ...connection(url), max: 4 });
   await pool.query(`
     create table if not exists reeve_store (id text primary key, data jsonb not null, updated_at timestamptz not null default now());
     create table if not exists reeve_ledger (seq integer primary key, entry jsonb not null, at timestamptz not null default now());
