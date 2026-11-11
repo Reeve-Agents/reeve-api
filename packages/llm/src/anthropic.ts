@@ -25,6 +25,13 @@ export class AnthropicProvider implements LLMProvider {
     this.client = new Anthropic();
   }
 
+  async completeText(system: string, user: string, opts?: { maxTokens?: number }): Promise<string> {
+    const response = await this.client.messages.create({ model: this.model, max_tokens: opts?.maxTokens ?? 600, system, messages: [{ role: "user", content: user }] });
+    const text = response.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("").trim();
+    if (!text) throw new Error(`${this.name} returned no text (stop_reason=${response.stop_reason}); the token limit may be too small`);
+    return text;
+  }
+
   async parseSop(sop: string, pack: PackId = "rent-collection", hints?: SopHints): Promise<Rulebook> {
     const { schema, toRulebook, system } = packSchema(pack, hints);
     const fallback = CLAUDE_MODELS.find((m) => m.model === this.model)?.fallback ?? false;

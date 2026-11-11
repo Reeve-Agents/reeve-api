@@ -12,6 +12,12 @@ export interface SopHints {
 export interface LLMProvider {
   readonly name: string;
   parseSop(sop: string, pack?: PackId, hints?: SopHints): Promise<Rulebook>;
+  /**
+   * Plain text completion, for the Operator's two narrow jobs (rephrasing an approved message,
+   * classifying a customer's reply). Providers without it (the fixture provider) mean "no LLM":
+   * the Operator then uses the plain template and sends every reply to the owner.
+   */
+  completeText?(system: string, user: string, opts?: { maxTokens?: number }): Promise<string>;
 }
 
 export class LLMRefusalError extends Error {}

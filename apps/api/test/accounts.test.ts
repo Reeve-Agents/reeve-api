@@ -19,6 +19,8 @@ async function setup(home = mkdtempSync(join(tmpdir(), "reeve-accounts-"))) {
     workspaceApp: (id, { store }) => {
       const ws = new Hono().basePath("/api");
       ws.get("/health", (c) => c.json({ workspace: id }));
+      // Takes a webhook only when it names this workspace, like a rail webhook for a bill another workspace sent.
+      ws.post("/webhooks/:rail", async (c) => ((await c.req.json<{ for?: string }>()).for === id ? c.json({ received: true, workspace: id }) : c.json({ ignored: true })));
       ws.get("/notes", (c) => c.json(Object.keys(store.data.datasets)));
       ws.post("/notes/:name", (c) => {
         store.data.datasets[c.req.param("name")] = { id: c.req.param("name"), name: "note", records: [], fields: [], createdAt: "" };
@@ -89,6 +91,26 @@ describe("accounts", () => {
     signOut();
     await call("POST", "/auth/email/verify", { access_token: "token-ani@example.com" });
     expect((await call("GET", "/notes")).json).toContain("ani-only");
+  });
+
+  it("lets webhooks in without a session and hands them to the workspace that owns the bill", async () => {
+    stubSupabase();
+    const { call, signOut } = await setup();
+    await call("POST", "/auth/email/verify", { access_token: "token-ani@example.com" });
+    const aniWs = (await call("GET", "/health")).json.workspace as string;
+    signOut();
+    await call("POST", "/auth/email/verify", { access_token: "token-budi@example.com" });
+    const budiWs = (await call("GET", "/health")).json.workspace as string;
+    signOut();
+    expect(aniWs).not.toBe(budiWs);
+    // No cookie: the session gate still blocks everything else, but not webhooks.
+    expect((await call("GET", "/notes")).status).toBe(401);
+    for (const [path, ws] of [["/webhooks/telegram", aniWs], ["/webhooks/mock", budiWs]] as const) {
+      const res = await call("POST", path, { for: ws }, false);
+      expect(res.status).toBe(200);
+      expect(res.json).toEqual({ received: true, workspace: ws });
+    }
+    expect((await call("POST", "/webhooks/mock", { for: "nobody" }, false)).json).toEqual({ ignored: true });
   });
 
   it("rejects a tampered cookie and an email that belongs to another account", async () => {
