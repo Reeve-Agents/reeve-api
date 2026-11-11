@@ -15,7 +15,7 @@ import { compareRuns, diffRulebooks, packOf, PackId, Rulebook, validateRulebook,
 import { PACKS } from "@reeve/core/packs";
 import { CardConversionError, LLMOutputError, LLMRefusalError, UnknownProviderError, type ProviderRegistry } from "@reeve/llm";
 import { genericScenario, rentScenario, repoRoot, runAttempt, runOperate, tenantsFromRecords } from "@reeve/pipeline";
-import { RailConfigError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
+import { RailConfigError, SubAccountRequiredError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
 import type { ChainAnchor } from "@reeve/anchor";
 import { type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
 import type { Sandbox } from "@reeve/sandbox";
@@ -568,8 +568,29 @@ export function createApp(rawDeps: AppDeps) {
     if (!entry) throw new OperatorError(`unknown rail ${id}`);
     if (!entry.info.available) throw new OperatorError(`${entry.info.label} is not set up: add ${entry.info.setup} to reeve/.env`);
     let rail = railCache.get(id);
-    if (!rail) railCache.set(id, (rail = entry.create()));
+    if (!rail) railCache.set(id, (rail = withMerchantAccount(entry.create(), () => store.data.railAccounts?.[id])));
     return rail;
+  };
+
+  /**
+   * Reeve never holds a merchant's money. A rail that bills per merchant (Xendit xenPlatform) is called with this
+   * workspace owner's own sub-account on every invoice, lookup, refund and payout; with none connected it refuses
+   * (SubAccountRequiredError, in Indonesian) before any request leaves.
+   */
+  const withMerchantAccount = (rail: PaymentRail, account: () => string | undefined): PaymentRail => {
+    if (!rail.perMerchantAccount) return rail;
+    const ctx = () => ({ account: account() });
+    return {
+      name: rail.name,
+      testMode: rail.testMode,
+      perMerchantAccount: true,
+      createInvoice: (req) => rail.createInvoice(req, ctx()),
+      getInvoice: (invoiceId) => rail.getInvoice(invoiceId, ctx()),
+      refund: (invoice, amount, key) => rail.refund(invoice, amount, key, ctx()),
+      ...(rail.simulatePayment ? { simulatePayment: (invoiceId: string) => rail.simulatePayment!(invoiceId, ctx()) } : {}),
+      ...(rail.payout ? { payout: (req: Parameters<NonNullable<PaymentRail["payout"]>>[0]) => rail.payout!(req, ctx()) } : {}),
+      parseWebhook: (raw, headers) => rail.parseWebhook(raw, headers),
+    };
   };
 
   /** Everything the Operator needs for one operation, re-checked on every call. */
@@ -622,7 +643,26 @@ export function createApp(rawDeps: AppDeps) {
     return c.json({ error: `rail error: ${err instanceof Error ? err.message : String(err)}` }, 502);
   };
 
-  app.get("/rails", (c) => c.json(deps.rails.map((r) => r.info)));
+  // `account` says whether this owner has connected their own sub-account on a per-merchant rail (the id itself stays server-side).
+  app.get("/rails", (c) => c.json(deps.rails.map((r) => ({ ...r.info, ...(r.info.id === "xendit" ? { perMerchantAccount: true, accountConnected: !!store.data.railAccounts?.xendit } : {}) }))));
+
+  // The owner's own Xendit xenPlatform sub-account (user id). Invoices are made on it with `for-user-id`, so the money
+  // settles there and never in Reeve's balance. https://docs.xendit.co/docs/accepting-payments-for-sub-accounts
+  app.get("/rails/xendit/account", (c) => c.json({ connected: !!store.data.railAccounts?.xendit, accountId: store.data.railAccounts?.xendit ?? null }));
+  app.put("/rails/xendit/account", async (c) => {
+    const { accountId } = await c.req.json<{ accountId?: unknown }>().catch(() => ({ accountId: undefined }));
+    const id = typeof accountId === "string" ? accountId.trim() : "";
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) return c.json({ error: "accountId must be your Xendit sub-account id (the user id from xenPlatform), 8-64 letters or digits" }, 400);
+    store.data.railAccounts = { ...store.data.railAccounts, xendit: id };
+    store.save();
+    return c.json({ connected: true, accountId: id });
+  });
+  app.delete("/rails/xendit/account", (c) => {
+    if (Object.values(store.data.operations).some((o) => o.rail === "xendit" && o.invoices.some((i) => i.status === "open"))) return c.json({ error: "open Xendit bills still belong to this account; settle or expire them first" }, 409);
+    if (store.data.railAccounts) delete store.data.railAccounts.xendit;
+    store.save();
+    return c.json({ connected: false, accountId: null });
+  });
 
   const schedulerCfg: SchedulerConfig = deps.scheduler ?? { enabled: false, daySeconds: 86_400, tickMs: 60_000, maxFailures: 3 };
   /** The operation as the studio sees it: the stored record plus where the scheduler's clock stands. */
@@ -674,7 +714,8 @@ export function createApp(rawDeps: AppDeps) {
     if (!run?.receipt || run.receipt.receipt_hash !== rb.approval.receiptHash) return c.json({ error: "the approved run is missing" }, 409);
     const { rail } = await c.req.json<{ rail?: string }>().catch(() => ({ rail: undefined }));
     try {
-      railFor(rail ?? "mock");
+      // A per-merchant rail needs the owner's own account before a run can even start.
+      if (railFor(rail ?? "mock").perMerchantAccount && !store.data.railAccounts?.[rail ?? "mock"]) throw new SubAccountRequiredError(rail === "xendit" ? "Xendit" : (rail ?? ""));
     } catch (err) {
       return operationError(c, err);
     }
@@ -1044,6 +1085,10 @@ export function createApp(rawDeps: AppDeps) {
     if (!event) return c.json({ ignored: true });
     for (const op of Object.values(store.data.operations).filter((o) => o.rail === id)) {
       if (!op.invoices.some((i) => i.invoiceId === event.invoiceId)) continue;
+      // A bill settled in someone else's sub-account (or one that names none) is not this owner's money: reject it.
+      if (railFor(id).perMerchantAccount && (!event.account || event.account !== store.data.railAccounts?.[id])) {
+        return c.json({ error: "this event's sub-account does not match the owner of the operation; ignored" }, 403);
+      }
       try {
         operatorFor(op).handleEvent(event);
       } catch (err) {
