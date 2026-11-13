@@ -180,6 +180,37 @@ npm run dev -w @reeve/landing
 
 Open http://localhost:5174. Design system and theses: `apps/landing/MASTER.md`. The simulated month it shows is `fixtures/kos-melati/sim-events.json`, the events of the 18 Oct CreateOS run.
 
+## Auditor: planted defects (13 Nov 2026)
+
+The Auditor tests its own spec by planting defects in the Builder's `rules.py` and replaying the spec on each one. A defect counts as caught when a spec case fails, the code crashes, or it runs longer than 5 s. **Every defect must be caught.** One survivor blocks the Owner's approval (`MUTANT_SURVIVED` is a blocker; until 13 Nov 2026, 80% was enough).
+
+| Kind | What the defect changes |
+|---|---|
+| boundary | a number or a comparison, off by one |
+| policy | a business choice, swapped (for example credit instead of refund) |
+| formula | an arithmetic operator, swapped, or a minus sign, dropped |
+| logic | a condition inverted, `and` and `or` swapped, a rule that always fires, a once-only flag flipped |
+| missing | a step that never happens, or an amount that is always 0 |
+| safety | an approval or "never" guard switched off, or an amount hidden from the approval limit |
+
+The formula, logic, missing and safety defects come from `packages/auditor/src/operators.ts`, which reads the generated Python. It does not touch strings or comments. A test checks that every defect parses as Python and differs from the real code.
+
+A defect that no input can tell apart from the real code is equivalent. It is left out and reported as info, with the reason. Examples: a minimarket approval limit that no order size can reach exactly, or the defects inside a "never" card that no record can trigger. Such a card is also reported to the owner as `GUARD_UNREACHABLE`, because the owner believes it protects them.
+
+Defect sources travel inside `mutants/manifest.json`, and the job writes each one to disk in the sandbox. A run uploads 15 files instead of 76. Upload time dropped from about 11 s to about 2 s.
+
+The runtime confirms it read those sources (`inline_sources` in the results). Without that flag the verdict fails with `JOB_FAILED`, because an older runtime would miss the files and count every load error as a caught defect. **Deploy `reeve-runtime` main before `reeve-api`.**
+
+Verified live on CreateOS (13 Nov 2026):
+
+| Pack | Builder tests | Spec cases | Planted defects | Run |
+|---|---|---|---|---|
+| Kos Melati (rent) | 7/7 | 11/11 | 61/61: boundary 23, policy 3, formula 8, logic 19, missing 8 | `run_mwf3i3zs`, 4.4 s, exec 272 ms |
+| Minimarket Berkah | 8/8 | 10/10 | 67/67: boundary 26, policy 2, formula 5, logic 22, missing 9, safety 3 (2 more equivalent) | `run_mwf3h24w`, 4.4 s, exec 337 ms |
+| Bimbel Cerdas (any SOP) | 3/3 | 14/14 | 70/70: boundary 17, formula 5, logic 34, missing 11, safety 3 | `sb-01m7ape4t075cynsabd20dvvq0`, exec 243 ms |
+
+Four Kos Melati runs with the new upload took 3.7 to 4.4 s end to end (18 Oct 2026, with 29 defects: 3.9 s). Both runs produced exactly the events of the 18 Oct runs, so `fixtures/*/sim-events.json` now names them.
+
 ## Tests
 
 ```bash
@@ -223,6 +254,7 @@ packages/anchor   Publishes ledger Merkle roots on a testnet and verifies them
 | SOP → rule cards with Claude | **Verified live (18 Oct 2026):** Opus 5.5 and Haiku 5.5 each parsed both sample SOPs (Kos Melati, Minimarket Berkah) into 8 cards with parameters identical to the hand-written fixtures (`fixtures/*/rulebook.claude-*.json`), and each rulebook passed the Auditor. Flat structured-output schema per pack (the full union exceeds the grammar size limit) |
 | Other model providers | OpenRouter, Gemini, Groq, DeepSeek, OpenAI, Ollama and any OpenAI-compatible server: implemented and tested against a fake server (schema mode, JSON-mode fallback, repair turn, refusal). **Not yet run against a real one** (no key in `.env`) |
 | Compiler, Auditor, mutation testing, receipts, ledger | Implemented and tested locally |
+| Auditor: six kinds of planted defect, every one must be caught (13 Nov 2026) | **Verified live on CreateOS:** Kos Melati 61/61, Minimarket 67/67, Bimbel Cerdas 70/70, all PASS. Survivors now block approval. See [Auditor: planted defects](#auditor-planted-defects-13-nov-2026) |
 | CreateOS sandbox adapter | **Verified live (18 Oct 2026):** create → upload 40 files → exec → destroy; egress lock confirmed (`npm run check:egress`: example.com and api.stripe.com blocked) |
 | API + web dashboard | **Verified live (18 Oct 2026):** Claude compile → CreateOS run (3.9 s, PASS) → timeline → owner passkey registered with a real authenticator. Approval flow tested with unit tests; the live approval needs the owner's biometric. The studio picks the business type and the model; a minimarket SOP read by Haiku 5.5 from the studio passed the Auditor in the local sandbox |
 | Owner app (PWA) | Implemented: Today, Approvals, Rooms, Ledger on real run events; manifest, icons and an app-shell service worker verified in a production preview (SW activated, standalone manifest). Installing on a real phone not yet tried |

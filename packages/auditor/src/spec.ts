@@ -129,6 +129,14 @@ export function buildSpecCases(rb: Rulebook): { cases: SpecCase[]; skipped: stri
         if (g.min_months >= 1) {
           tenants.push(tenant("almost", g.min_months - 1));
           expect.push({ date: addDays(issue, fee.days_after_due), tenant_id: "almost", type: "late_fee", amount: amountOn(RENT) });
+          // Tenure counts whole months: a tenant who moved in later in the month is still one month
+          // short on every day of this test, so no grace yet.
+          const lastDay = Number(issue.slice(8, 10)) + vetDay + 1; // day of month on the test's last day
+          const shortMoveIn = addDays(monthsBefore(issue, g.min_months), vetDay + 2);
+          if (Number(shortMoveIn.slice(8, 10)) === lastDay + 1 && lastDay + 1 <= 28) {
+            tenants.push({ ...tenant("almost-by-days", g.min_months), move_in: shortMoveIn });
+            expect.push({ date: addDays(issue, fee.days_after_due), tenant_id: "almost-by-days", type: "late_fee", amount: amountOn(RENT) });
+          }
         }
         cases.push({
           name: `long-term tenants (>= ${g.min_months} months) get ${g.extra_days} extra days`,

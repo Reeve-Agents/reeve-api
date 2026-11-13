@@ -42,7 +42,7 @@ reeve/
 ```text
 SOP text ──▶ builder.parseSop (LLM or fixture) ──▶ Rulebook (rule cards + questions)
         ──▶ builder.compile ──▶ rules.py + test_builder.py
-        ──▶ auditor.prepare ──▶ test_audit_spec.py + mutants/ + check_constraints.py
+        ──▶ auditor.prepare ──▶ audit_cases.json + mutants/manifest.json + constraints.json
         ──▶ sandbox.run (one sandbox for the whole job) ──▶ results.json
         ──▶ auditor.verdict ──▶ pass/fail + findings
         ──▶ receipts ──▶ receipt.json + Merkle root appended to ledger.jsonl
