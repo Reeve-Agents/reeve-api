@@ -9,7 +9,8 @@ import {
   type Rulebook,
   type SimEvent,
 } from "@reeve/core";
-import type { Mutant } from "./mutate";
+import type { Mutant, MutantKind } from "./mutate";
+import { generateStructuralMutants } from "./operators";
 
 /**
  * The Auditor's independent specification for the generic pack. Every case is a tiny scenario built
@@ -42,9 +43,11 @@ function scenario(start: string, days: number, records: Rec[]): GenericScenario 
   return { pack: "generic", start_date: start, days, key_field: KEY, records, updates: [] };
 }
 
-export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[]; skipped: string[] } {
+export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[]; skipped: string[]; reachedNevers: string[] } {
   const cases: GenericSpecCase[] = [];
   const skipped: string[] = [];
+  /** "Never" cards that at least one rule can actually run into. */
+  const reachedNevers = new Set<string>();
   const approvals = rb.cards.flatMap((c) => (c.type === "generic_approval" ? [c] : []));
   const nevers = rb.cards.flatMap((c) => (c.type === "generic_never" ? [c] : []));
 
@@ -110,6 +113,14 @@ export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[];
       cases.push({ name: `${a.id} limit on ${r.id}`, card: a.id, scenario: scenario(day, 1, [at, over]), types, rules: [r.id], expect: [at, over].map((x) => outcome(r, x, day)!) });
     }
 
+    // A limit written for one tool must not hold back a different tool, even far over the amount.
+    if (r.action.amount_field) {
+      for (const a of approvals.filter((a) => a.tool !== "*" && a.tool !== r.action.tool)) {
+        const over = { ...clean(base), [r.action.amount_field]: a.amount_above + 1, [KEY]: "other-tool" };
+        cases.push({ name: `${a.id} does not cover ${r.id}`, card: a.id, scenario: scenario(day, 1, [over]), types, rules: [r.id], expect: [outcome(r, over, day)!] });
+      }
+    }
+
     // "Never" constraints on this rule's tool.
     for (const n of nevers.filter((n) => n.tool === "*" || n.tool === r.action.tool)) {
       const hit: Rec = { ...base, ...satisfying(n.conditions, day), [KEY]: "forbidden" };
@@ -117,6 +128,7 @@ export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[];
         skipped.push(`${n.id}: cannot be tested on ${r.id}; no record can meet both`);
         continue;
       }
+      reachedNevers.add(n.id);
       cases.push({ name: `${n.id} on ${r.id}`, card: n.id, scenario: scenario(day, 1, [hit]), types, rules: [r.id], expect: [outcome(r, hit, day)!] });
     }
   }
@@ -124,8 +136,13 @@ export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[];
   for (const k of rb.cards.filter((c): c is GKpi => c.type === "generic_kpi")) {
     const [day] = firingDays(k.schedule, START);
     const row = (n: number, key: string): Rec => ({ ...satisfying(k.conditions, day), ...(k.field ? { [k.field]: n } : {}), [KEY]: key });
+    // A record the KPI must leave out. It is added where counting it by mistake would flip the
+    // outcome: next to the at-threshold records when alerting above, next to past-threshold when below.
+    const excluded: Rec | null = k.conditions.length ? { ...failing(k.conditions, day), ...(k.field ? { [k.field]: 1 } : {}), [KEY]: "not-counted" } : null;
+    const flipsWith = k.alert_if === "below" ? "past threshold" : "at threshold";
     // At the threshold: no alert. One step past it: alert.
     const past = k.alert_if === "below" ? k.threshold - 1 : k.threshold + 1;
+    let pastRecords: Rec[] | null = null;
     for (const [label, target] of [
       ["at threshold", k.threshold],
       ["past threshold", past],
@@ -140,8 +157,10 @@ export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[];
       } else records = [row(target, "k1")];
       const value = k.aggregate === "count" ? records.length : target;
       const alert = k.alert_if === "below" ? value < k.threshold : value > k.threshold;
+      if (label === "past threshold") pastRecords = records;
+      if (excluded && label === flipsWith) records = [...records, excluded];
       cases.push({
-        name: `${k.id} ${label}`,
+        name: `${k.id} ${label}${excluded && label === flipsWith ? " (one record outside the KPI)" : ""}`,
         card: k.id,
         scenario: scenario(day, 1, records),
         types: ["kpi_alert"],
@@ -149,18 +168,39 @@ export function buildGenericSpecCases(rb: Rulebook): { cases: GenericSpecCase[];
         expect: alert ? [{ date: day, tenant_id: "-", type: "kpi_alert", amount: value, note: k.id }] : [],
       });
     }
+
+    // Schedule: past the threshold on the day before a weekly or monthly check, still only one alert,
+    // on the check day.
+    if (pastRecords && k.schedule.every !== "day") {
+      const before = shiftDate(day, -1);
+      const value = k.aggregate === "count" ? pastRecords.length : past;
+      cases.push({
+        name: `${k.id} only on its schedule`,
+        card: k.id,
+        scenario: scenario(before, 2, pastRecords),
+        types: ["kpi_alert"],
+        rules: [k.id],
+        expect: [{ date: day, tenant_id: "-", type: "kpi_alert", amount: value, note: k.id }],
+      });
+    }
   }
-  return { cases, skipped };
+  return { cases, skipped, reachedNevers: [...reachedNevers] };
 }
 
 /** Planted defects for generated generic rules: every threshold, operator, schedule and limit. */
 export function generateGenericMutants(rulesPy: string): Mutant[] {
   const lines = rulesPy.split("\n");
   const out: Mutant[] = [];
-  const add = (i: number, replacement: string, description: string) => {
+  const seen = new Set<string>([rulesPy]);
+  const push = (kind: MutantKind, description: string, source: string) => {
+    if (seen.has(source)) return;
+    seen.add(source);
+    out.push({ id: "", kind, description, source });
+  };
+  const add = (i: number, replacement: string, description: string, kind: MutantKind = "boundary") => {
     const copy = [...lines];
     copy[i] = replacement;
-    out.push({ id: "", description, source: copy.join("\n") });
+    push(kind, description, copy.join("\n"));
   };
   const FLIP: Record<string, string> = { "<": "<=", "<=": "<", ">": ">=", ">=": ">", "==": "!=", "!=": "==" };
   lines.forEach((line, i) => {
@@ -172,10 +212,15 @@ export function generateGenericMutants(rulesPy: string): Mutant[] {
       add(i, line.replace(`= ${value}`, `= ${v - 1}`), `${name} ${v} → ${v - 1}`);
     }
     const once = line.match(/^(\w+_ONCE) = (True|False)/);
-    if (once) add(i, line.replace(once[2]!, once[2] === "True" ? "False" : "True"), `${once[1]} flipped`);
+    if (once) add(i, line.replace(once[2]!, once[2] === "True" ? "False" : "True"), `${once[1]} flipped`, "logic");
     // Comparisons against a named constant: off by one, or the wrong way round.
     const cmp = line.match(/ (<=|>=|==|!=|<|>) ((?:R|K)\w*?_C\d+|LIMIT_\d+|NEVER_\d+_C\d+|\w+_THRESHOLD|_text\((?:R|K)\w*?_C\d+\)|_text\(NEVER_\d+_C\d+\))/);
-    if (cmp) add(i, line.replace(` ${cmp[1]} ${cmp[2]}`, ` ${FLIP[cmp[1]!]} ${cmp[2]}`), `${cmp[2]} comparison ${cmp[1]} → ${FLIP[cmp[1]!]}`);
+    if (cmp) {
+      const kind: MutantKind = cmp[1] === "==" || cmp[1] === "!=" ? "logic" : "boundary";
+      add(i, line.replace(` ${cmp[1]} ${cmp[2]}`, ` ${FLIP[cmp[1]!]} ${cmp[2]}`), `${cmp[2]} comparison ${cmp[1]} → ${FLIP[cmp[1]!]}`, kind);
+    }
   });
+  // Structural defects in every rule, KPI and guard function; shared helpers and glue are left alone.
+  for (const m of generateStructuralMutants(rulesPy)) push(m.kind, m.description, m.source);
   return out.map((m, n) => ({ ...m, id: `m${String(n + 1).padStart(3, "0")}` }));
 }

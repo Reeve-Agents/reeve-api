@@ -34,7 +34,7 @@ The owner app (`apps/web/src/owner`) renders only the contract: the Today tab, t
 |---|---|
 | Builder tests | 8/8 |
 | Auditor spec | 10/10 cases |
-| Planted defects | 30/30 caught (one more, `PO_APPROVAL_ABOVE + 1`, is reported as an equivalent mutant: no order size can be worth exactly Rp2,000,001) |
+| Planted defects | 30/30 caught (one more, `PO_APPROVAL_ABOVE + 1`, is reported as an equivalent mutant: no order size can be worth exactly Rp2,000,001). **13 Nov 2026:** 67/67 with the six defect kinds (run `run_mwf3h24w`, `sb-01m7ap89…`, receipt `081f122e…`); 2 equivalent |
 | Constraints | no violations |
 | Sandbox | `sb-01m570snrebjtmxrrbdzc1cz32`, egress locked, exec 0.5 s |
 | Receipt | `5d1fba6f…` → ledger #24 |
@@ -103,7 +103,7 @@ and the connector ladder in "Reeve - Connectors and Composio".
 | Builder codegen | `codegen/minimarket.ts`: constants and hooks (`reorder_due`, `order_quantity`, `markdown_percent`, `supplier_for`) plus Builder tests |
 | Auditor spec | Reorder at exactly the threshold and not one above; PO over the limit becomes an approval request, never an order; markdown at H-30 and H-14 only; never below cost; switch supplier on day 3 of lateness, not day 2 |
 | Constraints | Stock never negative; no markdown below cost; no PO above the limit without approval |
-| Mutants | The existing numeric and operator mutants apply unchanged to the new `rules.py` |
+| Mutants | The existing numeric and operator mutants apply unchanged to the new `rules.py`; since 13 Nov 2026 also the structural ones (formula, logic, missing, safety) from `packages/auditor/src/operators.ts` |
 | Owner view | `packages/core/src/packs/minimarket.ts` implementing the contract above, added to `PACKS` |
 | Fixture | `fixtures/minimarket/` with an SOP in Bahasa, a hand-written rulebook, and the events of a real CreateOS run once it passes |
 
