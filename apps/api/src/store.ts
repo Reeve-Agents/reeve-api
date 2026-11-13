@@ -73,6 +73,8 @@ export interface StoreData {
   /** Owners' records for generic SOPs (a CSV upload or a connector read). */
   datasets: Record<string, DatasetRecord>;
   passkeys: PasskeyRecord[];
+  /** This owner's own account on a per-merchant rail (Xendit xenPlatform sub-account id), so the money settles there, never in Reeve's balance. */
+  railAccounts?: Record<string, string>;
   challenges: {
     registration?: { challenge: string; at: number };
     approvals: Record<string, { challenge: string; receiptHash: string; runId: string; at: number }>;

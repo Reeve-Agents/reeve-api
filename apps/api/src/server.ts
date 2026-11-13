@@ -9,6 +9,7 @@ import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
+import { schedulerFromEnv } from "./scheduler";
 import { filePersistence } from "./persistence";
 import { openPostgres } from "./pg";
 
@@ -41,7 +42,10 @@ const persistence = process.env.DATABASE_URL ? await openPostgres(process.env.DA
 const supabaseKey = process.env.SUPABASE_SECRET_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
 const supabase = process.env.SUPABASE_URL && supabaseKey ? { url: process.env.SUPABASE_URL.replace(/\/$/, ""), key: supabaseKey } : null;
 
-const { app } = await createAccountsApp({
+// REEVE_SCHEDULER=on advances every operation by itself; REEVE_SCHEDULER_DAY_SECONDS=30 shows a business day every 30 seconds.
+const scheduler = schedulerFromEnv();
+
+const { app, openAll } = await createAccountsApp({
   persistence,
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
@@ -68,6 +72,11 @@ const { app } = await createAccountsApp({
       rp,
       // REEVE_ANCHOR_PRIVATE_KEY (testnet wallet from `npm run anchor:wallet`) turns on-chain anchoring on.
       anchor,
+      scheduler,
+      // REEVE_OPERATOR_LLM=on: the LLM words messages and reads replies (sends tenant names and amounts to the provider).
+      operatorLlm: ["on", "1", "true", "yes"].includes((process.env.REEVE_OPERATOR_LLM ?? "").toLowerCase()),
+      operatorModel: process.env.REEVE_OPERATOR_MODEL || undefined,
+      telegramWebhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined,
       onPasskeyAdded,
     }).fetch,
 });
@@ -79,6 +88,11 @@ const server = serve({ fetch: app.fetch, port }, () => {
     `reeve api on http://localhost:${port}/api · default llm ${providers.defaultId} · ${ready.length} parsers ready (${ready.join(", ")}) · rails ${railIds.join(", ")} · origin ${origin} · storage ${persistence.kind} · email login ${supabase ? "on" : "off"}`,
   );
 });
+
+if (scheduler.enabled) {
+  await openAll();
+  console.log(`scheduler on: one business day every ${scheduler.daySeconds}s, checked every ${scheduler.tickMs}ms`);
+}
 
 // On a redeploy, finish the queued Postgres writes before exiting.
 for (const signal of ["SIGTERM", "SIGINT"] as const) {

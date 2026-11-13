@@ -99,6 +99,20 @@ export class OpenAICompatibleProvider implements LLMProvider {
     }
   }
 
+  async completeText(system: string, user: string, opts?: { maxTokens?: number }): Promise<string> {
+    const res = await this.fetch(`${this.opts.baseURL.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(this.opts.apiKey ? { authorization: `Bearer ${this.opts.apiKey}` } : {}), ...this.opts.headers },
+      body: JSON.stringify({ model: this.opts.model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: opts?.maxTokens ?? 600 }),
+      signal: AbortSignal.timeout(this.opts.timeoutMs ?? 60_000),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${this.opts.id} returned HTTP ${res.status}: ${text.slice(0, 200)}`);
+    const content = (JSON.parse(text) as ChatResponse).choices?.[0]?.message?.content;
+    if (!content) throw new Error(`${this.name} returned no content`);
+    return content.trim();
+  }
+
   private system(pack: PackId, hints?: SopHints): string {
     const { system } = packSchema(pack, hints);
     if (this.mode === "schema") return system;

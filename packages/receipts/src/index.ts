@@ -120,7 +120,7 @@ export interface OperationBody {
   at: string;
   operation_id: string;
   rail: string;
-  event: "invoice_created" | "payment_received" | "message_logged" | "exception_raised" | "refund_issued" | "credit_kept" | "blocked" | "rules_upgraded";
+  event: "invoice_created" | "payment_received" | "message_logged" | "message_sent" | "reply_received" | "reply_actioned" | "exception_raised" | "refund_issued" | "credit_kept" | "blocked" | "rules_upgraded";
   tenant?: string;
   amount?: number;
   ref?: string;

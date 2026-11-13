@@ -1,6 +1,43 @@
 import type { OperationAction, OperationException, OperationInvoice, OperationPayment, OperationRecord, Rulebook, Scenario, SimEvent, Tenant } from "@reeve/core";
 import type { PaymentRail, RailEvent, RailInvoice } from "@reeve/rails";
 import type { OperationBody } from "@reeve/receipts";
+import { messageFor, toolCallFor, type Contact, type Message, type MessageFacts, type MessageKind, type ToolCall } from "./messages";
+
+export { minimarketPack, type SupplierContacts } from "./minimarket";
+export { PAYMENT_TOOLS, PaymentsConnector, withPayments } from "./payments";
+export { contactsFromRecords, messageFor, RENT_MESSAGE_TOOLS, toolCallFor, type Contact, type Message, type MessageFacts, type MessageKind, type ToolCall } from "./messages";
+
+/** A rent operation with the contact details of its tenants (read from the owner's sheet when the run starts). */
+export type RentOperationRecord = OperationRecord & { contacts?: Record<string, Contact>; replies?: ReplyRecord[]; holds?: Record<string, string> };
+
+/** What the classifier made of a tenant's reply. Only these four exist; anything else is "unclear". */
+export const REPLY_INTENTS = ["promise_to_pay", "already_paid", "asks_relief", "unclear"] as const;
+export type ReplyIntent = (typeof REPLY_INTENTS)[number];
+
+/** The only things the Operator may do about a reply; each was approved with the rulebook. Everything else is the owner's. */
+export type ReplyAction = "reschedule_reminder" | "check_payment" | "hand_to_owner";
+
+export interface ReplyRecord {
+  id: string;
+  at: string;
+  tenant: string;
+  text: string;
+  intent: ReplyIntent;
+  /** "llm" when a model classified it, "none" when no model is configured (then every reply goes to the owner). */
+  source: "llm" | "none";
+  action: ReplyAction;
+  status: "actioned" | "waiting_owner" | "resolved";
+  detail: string;
+  /** Set when a model was configured but its call failed (then `source` is "none"). */
+  error?: string;
+  /** For reschedule_reminder: reminders for this bill are held through this date. */
+  holdUntil?: string;
+}
+
+export type ReplyClassifier = (text: string, ctx: { name: string; room: string; amount: number; today: string }) => Promise<{ intent: string; promised_date?: string | null } | null>;
+
+/** An action the Operator took that sent a real message. Core's union gains "sent"; until it ships, the value is cast. */
+const SENT = "sent" as OperationAction["outcome"];
 
 /**
  * The broker runs outside every sandbox and is the only part of Reeve that holds rail keys.
@@ -22,6 +59,16 @@ export interface OperatorDeps {
   record: (body: Omit<OperationBody, "at" | "operation_id" | "rail" | "receipt_hash">) => void;
   save: () => void;
   now?: () => Date;
+  /**
+   * Makes one tool call through the connector registry (Telegram, Gmail, ...). Without it every
+   * message is only logged. When the call fails (no key, no account connected) the broker records
+   * the message on the Log connector instead and says so.
+   */
+  send?: (call: ToolCall) => Promise<{ ok: boolean; connector: string; error?: string }>;
+  /** Rephrases the approved template in the owner's tone. It may change wording, never the facts. Null keeps the template. */
+  draft?: (msg: Message) => Promise<string | null>;
+  /** Reads a tenant's reply into one of four intents. Absent (no LLM key) means every reply goes to the owner. */
+  classify?: ReplyClassifier;
 }
 
 export class OperatorError extends Error {}
@@ -50,9 +97,11 @@ export function newOperation(input: {
   rail: string;
   startDate: string;
   tenants: Tenant[];
+  contacts?: Record<string, Contact>;
   now?: Date;
-}): OperationRecord {
+}): RentOperationRecord {
   return {
+    ...(input.contacts && Object.keys(input.contacts).length ? { contacts: input.contacts } : {}),
     id: input.id,
     rulebookId: input.rulebookId,
     receiptHash: input.receiptHash,
@@ -69,6 +118,13 @@ export function newOperation(input: {
     log: [],
     createdAt: (input.now ?? new Date()).toISOString(),
   };
+}
+
+/** A drafted text is only used if it still carries the payment link and the amount the template states. */
+export function keepsFacts(text: string, facts: MessageFacts): boolean {
+  if (facts.payUrl && !text.includes(facts.payUrl)) return false;
+  const digits = (s: string) => s.replace(/[^0-9]/g, "");
+  return facts.amount <= 0 || digits(text).includes(String(facts.amount));
 }
 
 /** The day a payment seen now counts on: the next business day not yet processed. */
@@ -132,7 +188,7 @@ export class Operator {
       }
     }
     op.clock = toDate;
-    this.say(`clock at ${toDate}: ${done.filter((a) => a.outcome === "invoiced").length} bills sent, ${done.filter((a) => a.outcome === "logged").length} messages logged, ${done.filter((a) => a.outcome === "raised").length} exceptions`);
+    this.say(`clock at ${toDate}: ${done.filter((a) => a.outcome === "invoiced").length} bills sent, ${done.filter((a) => a.outcome === SENT).length} reminders sent, ${done.filter((a) => a.outcome === "logged").length} messages logged, ${done.filter((a) => a.outcome === "raised").length} exceptions`);
     return done;
   }
 
@@ -144,17 +200,26 @@ export class Operator {
         const due = (e.amount ?? 0) - (credit.get(`${e.tenant_id}|${e.date}`) ?? 0);
         if (due <= 0) return { ...base, outcome: "covered_by_credit", detail: `${this.name(e.tenant_id)}: covered by credit, no bill sent` };
         const inv = await this.bill(e.tenant_id, `${e.invoice_id}`, "rent", due, `Sewa ${e.invoice_id}`, 14);
-        return { ...base, amount: due, outcome: "invoiced", detail: `${this.name(e.tenant_id)}: rent ${rp(due)} on ${op.rail} (${inv.invoiceId})` };
+        const out = await this.notify(e.tenant_id, "bill", due, `${e.invoice_id}`, inv.payUrl);
+        return { ...base, amount: due, outcome: "invoiced", detail: `${this.name(e.tenant_id)}: rent ${rp(due)} on ${op.rail} (${inv.invoiceId}). ${out.detail}` };
       }
       case "late_fee": {
         const inv = await this.bill(e.tenant_id, `${e.invoice_id}:fee:${e.date}`, "late_fee", e.amount ?? 0, `Denda keterlambatan ${e.invoice_id}`, 7);
-        return { ...base, outcome: "invoiced", detail: `${this.name(e.tenant_id)}: late fee ${rp(e.amount ?? 0)} on ${op.rail} (${inv.invoiceId})` };
+        const out = await this.notify(e.tenant_id, "late_fee", e.amount ?? 0, `${e.invoice_id}`, inv.payUrl);
+        return { ...base, outcome: "invoiced", detail: `${this.name(e.tenant_id)}: late fee ${rp(e.amount ?? 0)} on ${op.rail} (${inv.invoiceId}). ${out.detail}` };
       }
       case "reminder":
       case "notice": {
-        this.deps.record({ event: "message_logged", tenant: e.tenant_id, amount: e.amount, ref: `${e.type}:${e.invoice_id}` });
+        // The link of the rent bill this reminder is about, so the tenant can pay straight from the message.
+        const open = op.invoices.find((i) => i.key === e.invoice_id && i.status === "open");
+        const hold = (op as RentOperationRecord).holds?.[`${e.invoice_id}`];
+        if (hold && hold >= e.date) {
+          this.deps.record({ event: "message_logged", tenant: e.tenant_id, amount: e.amount ?? 0, ref: `held:${e.type}:${e.invoice_id}` });
+          return { ...base, outcome: "logged", detail: `${this.name(e.tenant_id)}: ${e.type} held, the tenant promised to pay by ${hold}.` };
+        }
+        const out = await this.notify(e.tenant_id, e.type, e.amount ?? 0, `${e.invoice_id}`, open?.payUrl);
         const what = e.type === "reminder" ? `reminder, ${rp(e.amount ?? 0)} still due` : "formal notice to vacate";
-        return { ...base, outcome: "logged", detail: `${this.name(e.tenant_id)}: ${what}. Logged, not sent: no WhatsApp or email connector yet` };
+        return { ...base, outcome: out.sent ? SENT : "logged", detail: `${this.name(e.tenant_id)}: ${what}. ${out.detail}` };
       }
       case "credit":
       case "refund_request": {
@@ -197,6 +262,35 @@ export class Operator {
     }
   }
 
+  /**
+   * Tell the tenant. The channel is the tenant's Telegram chat, else their email, else the log; a send
+   * that fails (no connector key, no account connected) falls back to the Log connector and says so.
+   */
+  private async notify(tenant: string, kind: MessageKind, amount: number, invoice: string, payUrl?: string): Promise<{ sent: boolean; detail: string }> {
+    const t = this.op.tenants.find((x) => x.id === tenant);
+    const facts: MessageFacts = { name: t?.name ?? tenant, room: t?.room ?? tenant, amount, payUrl, invoice };
+    const msg = messageFor(kind, facts);
+    if (this.deps.draft) {
+      const drafted = await this.deps.draft(msg).catch(() => null);
+      if (drafted && keepsFacts(drafted, facts)) msg.body = drafted;
+    }
+    const call = toolCallFor(msg, (this.op as RentOperationRecord).contacts?.[tenant]);
+    const ref = `${kind}:${invoice}`;
+    const log = async (why: string) => {
+      const logCall = toolCallFor(msg, undefined);
+      await this.deps.send?.(logCall).catch(() => undefined);
+      this.deps.record({ event: "message_logged", tenant, amount, ref });
+      return { sent: false, detail: `Message logged, not sent: ${why}.` };
+    };
+    if (call.tool === "LOG" || !this.deps.send) return log(call.tool === "LOG" ? "no Telegram chat id or email for this tenant" : "no connector configured");
+    const r = await this.deps.send(call).catch((err) => ({ ok: false, connector: "none", error: err instanceof Error ? err.message : String(err) }));
+    if (r.ok && r.connector !== "log") {
+      this.deps.record({ event: "message_sent", tenant, amount, ref: `${ref}@${call.tool}:${r.connector}`.slice(0, 200) });
+      return { sent: true, detail: `${kind === "bill" ? "Bill" : "Message"} sent via ${call.tool} (${r.connector})${payUrl ? " with the payment link" : ""}.` };
+    }
+    return log(r.error ? `${call.tool} failed (${r.error})` : `${call.tool} has no connected account`);
+  }
+
   private async bill(tenant: string, key: string, kind: OperationInvoice["kind"], amount: number, description: string, dueInDays: number) {
     const op = this.op;
     const existing = op.invoices.find((i) => i.key === key);
@@ -236,6 +330,91 @@ export class Operator {
     this.deps.record({ event: "payment_received", tenant: row.tenant, amount: inv.amountPaid, ref: row.invoiceId });
     this.say(`${this.name(row.tenant)} paid ${rp(inv.amountPaid)} (${row.invoiceId})`);
     return true;
+  }
+
+  /**
+   * A tenant answered one of our messages. The classifier only picks an intent; the action each
+   * intent maps to is fixed here, and bounded by the approved rulebook:
+   *  - promise_to_pay -> hold reminders until that date (needs a reminder rule, a date within 30
+   *    days, and an amount at or under the rulebook's approval limit; no limit card means 0)
+   *  - already_paid -> ask the rail; if it does not show the payment, the owner decides
+   *  - asks_relief, unclear, no model, no open bill, amount over the limit -> the owner
+   * No message goes back to the tenant from here. Every step is on the ledger.
+   */
+  async handleReply(tenantId: string, text: string): Promise<ReplyRecord> {
+    const op = this.op as RentOperationRecord;
+    const t = op.tenants.find((x) => x.id === tenantId);
+    if (!t) throw new OperatorError(`no tenant ${tenantId} in this operation`);
+    const today = op.clock === null ? op.startDate : addDays(op.clock, 1);
+    const open = [...op.invoices].reverse().find((i) => i.tenant === tenantId && i.kind === "rent" && i.status === "open");
+    const clean = text.replace(/\s+/g, " ").trim().slice(0, 500);
+    // A model that fails is not the same as no model: keep the error, show it, record it.
+    let modelError: string | undefined;
+    const verdict = this.deps.classify
+      ? await this.deps.classify(clean, { name: t.name, room: t.room, amount: open?.amount ?? 0, today }).catch((err) => {
+          modelError = (err instanceof Error ? err.message : String(err)).slice(0, 300);
+          return null;
+        })
+      : null;
+    const intent: ReplyIntent = verdict && (REPLY_INTENTS as readonly string[]).includes(verdict.intent) ? (verdict.intent as ReplyIntent) : "unclear";
+    const rec: ReplyRecord = {
+      id: `reply-${tenantId}-${(op.replies?.length ?? 0) + 1}`,
+      at: this.now().toISOString(),
+      tenant: tenantId,
+      text: clean,
+      intent,
+      source: verdict ? "llm" : "none",
+      action: "hand_to_owner",
+      status: "waiting_owner",
+      detail: "",
+      ...(modelError ? { error: modelError } : {}),
+    };
+    (op.replies ??= []).push(rec);
+    this.deps.record({ event: "reply_received", tenant: tenantId, amount: open?.amount, ref: `${rec.id}:${intent}${modelError ? `:model_error ${modelError}` : ""}`.slice(0, 200) });
+    if (modelError) console.warn(`[reeve] reply classifier failed: ${modelError}`);
+
+    const owner = (why: string) => {
+      rec.detail = `${this.name(tenantId)} replied: "${clean.slice(0, 120)}". ${why} Waiting for the owner.`;
+    };
+    const limit = policyFor(this.rulebook).refundApprovalAbove;
+    const hasReminder = this.rulebook.cards.some((c) => c.type === "reminder");
+    if (modelError) owner(`The language model failed (${modelError}), so this reply goes to the owner.`);
+    else if (!verdict) owner("No language model is configured, so every reply goes to the owner.");
+    else if (!open) owner("No open rent bill for this tenant.");
+    else if (open.amount > limit) owner(`The bill (${rp(open.amount)}) is above the owner-approval limit (${rp(limit)}).`);
+    else if (intent === "promise_to_pay") {
+      const date = verdict.promised_date ?? "";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date < today || date > addDays(today, 30)) owner("The promised date is missing or outside the next 30 days.");
+      else if (!hasReminder) owner("The rulebook has no reminder rule to reschedule.");
+      else {
+        op.holds = { ...op.holds, [open.key]: date };
+        rec.action = "reschedule_reminder";
+        rec.status = "actioned";
+        rec.holdUntil = date;
+        rec.detail = `${this.name(tenantId)} promised to pay by ${date}. Reminders for ${open.key} are held until then.`;
+      }
+    } else if (intent === "already_paid") {
+      await this.refresh();
+      rec.action = "check_payment";
+      if (open.status === "open") owner("The rail does not show a payment yet.");
+      else {
+        rec.status = "actioned";
+        rec.detail = `${this.name(tenantId)} said it paid; the rail confirms the bill is ${open.status}.`;
+      }
+    } else owner(intent === "asks_relief" ? "They asked for relief, which only the owner can grant." : "The reply is unclear.");
+
+    this.deps.record({ event: "reply_actioned", tenant: tenantId, amount: open?.amount, ref: `${rec.id}:${rec.action}:${rec.status}`.slice(0, 200) });
+    this.say(rec.detail);
+    return rec;
+  }
+
+  /** The owner has dealt with a reply that was waiting for them. */
+  resolveReply(id: string): ReplyRecord {
+    const rec = (this.op as RentOperationRecord).replies?.find((r) => r.id === id);
+    if (!rec) throw new OperatorError(`no reply ${id}`);
+    rec.status = "resolved";
+    this.deps.save();
+    return rec;
   }
 
   /** Ask the rail for every open bill's status (for local runs without a public webhook URL). */
