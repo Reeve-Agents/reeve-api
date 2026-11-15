@@ -44,7 +44,7 @@
     "zod": "^4.6.7",
     "@reeve/core": "github:Reeve-Agents/reeve-core#main",
     "@reeve/connectors": "github:Reeve-Agents/reeve-connectors#main",
-    "@reeve/rails": "github:Reeve-Agents/reeve-payments#feat/xendit-subaccounts",
+    "@reeve/rails": "github:Reeve-Agents/reeve-payments#main",
     "tsx": "^4.23.15"
   },
   "repository": "github:Reeve-Agents/reeve-api"
