@@ -55,7 +55,7 @@ if (args.has("--llm")) {
   const haiku = new AnthropicProvider("claude-haiku-5-5");
   worker = async (system, user) => {
     let usage: { name: string; model: string; input_tokens: number; output_tokens: number } | undefined;
-    const text = await haiku.completeText(system, user, { maxTokens: 300, onUsage: (u) => (usage = { name: "worker_draft", model: u.model, input_tokens: u.inputTokens, output_tokens: u.outputTokens }) });
+    const text = await haiku.completeText(system, user, { maxTokens: 1200, onUsage: (u) => (usage = { name: "worker_draft", model: u.model, input_tokens: u.inputTokens, output_tokens: u.outputTokens }) });
     return { text, usage };
   };
   say("Worker: Claude Haiku 5.5");

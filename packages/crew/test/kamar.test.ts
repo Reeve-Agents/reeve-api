@@ -81,3 +81,18 @@ describe("Playbook B: kamar kosong terisi sendiri", () => {
     expect(nextSlot("2026-12-05", ["2026-12-07 10:00"])).toBe("2026-12-07 11:00"); // 6 Dec is a Sunday
   });
 });
+
+describe("Worker failure", () => {
+  it("falls back to the template when the model call throws", async () => {
+    const { deps } = await testDeps({
+      worker: async () => {
+        throw new Error("rate limited");
+      },
+    });
+    const crew = new KamarKosong(deps, newState(playbookB()));
+    await crew.approveB(DEMO_PASSKEY);
+    const draft = await crew.roomVacant("4", "2 Desember");
+    expect(draft.text).toContain("Rp1.500.000");
+    expect(crew.state.decisions.some((d) => d.action === "draft_failed")).toBe(true);
+  });
+});

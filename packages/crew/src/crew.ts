@@ -180,7 +180,14 @@ export class Crew {
     for (let attempt = 0; attempt < 2 && this.deps.worker && this.charge(step); attempt++) {
       const system = "Kamu menulis teks pendek untuk usaha kos. Pakai hanya fakta yang diberikan. Jangan menambah harga, klaim, tautan atau nama. Akhiri dengan: (dibuat dengan bantuan AI)";
       const user = this.ws.pseudonyms.redact(`${opts.brief}\n\nFakta:\n${opts.facts_text}${attempt ? `\n\nDraf sebelumnya ditolak: ${hits.map((h) => h.message).join("; ")}` : ""}`);
-      const res = await this.deps.worker(system, user);
+      let res: Awaited<ReturnType<WorkerFn>>;
+      try {
+        res = await this.deps.worker(system, user);
+      } catch (err) {
+        // A failed model call never blocks the step: the code template is used instead.
+        await this.record(worker, { input: user, output: { error: String(err instanceof Error ? err.message : err).slice(0, 160) }, reasoning: "The Worker call failed, so the template written by code is used.", action: "draft_failed" });
+        break;
+      }
       const candidate = res.text.trim();
       const candidateHits = validate(candidate, opts.facts, step.checks);
       await this.record(worker, { input: user, output: candidate, reasoning: `Worker worded the ${step.recipe.skill} brief from code-supplied facts only (attempt ${attempt + 1}).`, action: "draft", usage: res.usage });

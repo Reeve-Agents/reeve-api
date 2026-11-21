@@ -9,6 +9,78 @@
 
 Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Design notes live in the private reeve-vault repo.
 
+## Reeve on Meko (ContextCon 2027, challenge 07 "Show Your Work")
+
+Reeve's agents now do work, not only watch: they fill a vacant room, run daily content, answer prospects and explain their own decisions. Every turn is a [Meko](https://mekodata.ai) trace with its reasoning, and every trace is bound to Reeve's hash-chained receipt ledger, so **Meko tells you why, and Reeve proves it was not rewritten.**
+
+> **What existed before 7 Nov 2026.** The Builder, the Auditor with planted defects, the Operator (broker), the payment rails, the receipt ledger, the Monad testnet anchor and the web studio were built before ContextCon, for earlier hackathons (this repo was imported on 20 Oct 2026). Everything Meko-related is new and lives on branch `feat/meko-active-crew`, in dated commits from 21 Nov 2026: `packages/meko`, `packages/crew`, `apps/api/src/meko.ts`, `apps/cli/src/crew-demo.ts`, the `decision` ledger entry and the `?view=jejak` page in reeve-web.
+
+```mermaid
+flowchart LR
+  SOP["Owner SOP / target"] --> B["Builder"] --> A["Auditor<br/>planted defects"] --> O["Owner passkey"]
+  O --> OP["Operator (code decides)"]
+  OP -- "context_search first" --> M[("Meko datapack<br/>reeve-kos-melati")]
+  OP --> W["Worker (LLM words only)"] --> V["Validator (code)"]
+  B & A & O & OP & W & V & ASK["Tanya usaha (read-only)"] -- "turn + reasoning<br/>metadata: reeve_receipt" --> M
+  B & A & O & OP & W & V & ASK -- "decision entry<br/>trace_hash" --> L[("Receipt ledger<br/>hash chain")]
+  L -- "Merkle root" --> C["Monad testnet anchor"]
+  M & L --> R["Rapor Usaha + Jejak keputusan"]
+```
+
+| Meko feature | How Reeve uses it |
+|---|---|
+| Datapack | One per workspace: `reeve-<workspace>` (`reeve-kos-melati`). |
+| Conversations + `reasoning` | One conversation per agent per run (Builder, Auditor, owner, Operator, Worker, Validator, Ask), tied by `run_id`, each agent in its own session. Every decision has `reasoning`, so Meko shows a Decision trace card. |
+| `context_search` | The Operator searches before it acts: owner exceptions before a late fee, a prospect's history before a reply, past content results before a plan. The hits are hashed into the decision. |
+| Memory + `memory_promote` | Owner exceptions ("Kamar 3 boleh telat sampai 10 hari"), prospect histories (pseudonymised), content results, autonomy changes. Promoted memories are shared by every agent. |
+| Learning | Playbook C reads which hook brought the most chats from shared memory and picks the next post's hook from it. |
+| Artifacts (SHA-256) | Audit reports, contract drafts, the Rapor Usaha. |
+| `track_token_usage` | Called for every Worker LLM call when the server offers it (Meko Cloud); on local Meko the usage stays in the message metadata. |
+| Decision tracing | `GET /api/meko/public/decisions/:receipt` and `?view=jejak` rebuild one decision with its chain, what it looked up, and the proof. |
+
+**Tamper-evident traces.** For each turn Reeve hashes exactly what Meko stores (`input`, `output`, `reasoning`, `plan`, and the ids of what `context_search` returned) and appends a `decision` entry with that `trace_hash` to the hash-chained ledger. The entry's hash is the receipt, written back into the Meko message as `metadata.reeve_receipt`. `verifyDecision` re-reads the message from Meko, recomputes the hash, checks the chain and the Merkle proof against the first anchor after it. Edit the reasoning in Meko, or a ledger line, and the check names which one changed.
+
+**What the crew does on Kos Melati** (synthetic 30-room kos, pseudonymised):
+
+- **Playbook B, "kamar kosong terisi sendiri"**: vacancy, listing drafted by the Worker and checked by the Validator, owner review, publish, CS on whitelisted intents only (escalations win), viewing booked, Rp500.000 deposit on the test-mode rail within the approved bound, contract draft, owner passkey. It stops itself at its target.
+- **Playbook C, content loop**: plan from business truth (room vacant longest, paydays, campus calendar), script and caption, Validator, owner review, publish, measure (simulated), learn.
+- **Auditor for playbooks**: worst-case budget math, review on every publish or payment, a stop condition, reachability of every step, and planted violations plus bad drafts that must all be caught.
+- **Earned autonomy** per action class (`ask`, `ask_if_unusual`, `auto_digest`, `auto`), promoted only on clean receipts with the owner's passkey, demoted on any override, complaint or 10-minute undo.
+- **Tanya usaha**: a read-only agent that answers "kenapa saya didenda?" from the trace, with a link to the proof.
+- **One payment-plan bound**: "maksimal 2 cicilan, lunas sebelum tanggal 25", audited with planted bad offers; offers inside it cite it, the rest go to the owner.
+- **Rapor Usaha**: the audit report generated from traces and receipts, stored in Meko as an artifact.
+
+### Run it
+
+```bash
+export MEKO_CONTEXT_ENGINE_DIR=$HOME/.local/share/meko/app/current/context_engine
+export MEKO_WEB_UI_DIR=$HOME/.local/share/meko/app/current/web_ui/dist
+meko start
+```
+
+```bash
+npm run crew:demo -- --fresh
+```
+
+```bash
+npm run dev
+```
+
+Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/api/meko/public/report.html`. Add `--llm` to let Claude Haiku 5.5 word the drafts (needs `ANTHROPIC_API_KEY`). For Meko Cloud set `MEKO_API_KEY` (and optionally `MEKO_MCP_URL`) in `.env`; without it the local Meko and `meko token` are used. `REEVE_MEKO_PUBLIC_ASK=on` opens `POST /api/meko/public/ask`.
+
+### Measured on Kos Melati (local Meko 1.20261116.0, 21 Nov 2026, `crew:demo --llm`)
+
+| | |
+|---|---|
+| Traced decisions in Meko | 79, all verified against their receipts |
+| SOP audit | 61/61 planted defects caught, 11 spec cases (local sandbox) |
+| Playbook audits | B: 19/19 planted violations and 12/12 bad drafts caught; C: 13/13 and 12/12 |
+| LLM calls | 6 Worker drafts (Claude Haiku 5.5), 1,605 input + 2,813 output tokens, every draft passed the Validator |
+| Model calls | 6 of 79 turns, all wording drafts; no model call decides whether to act |
+| `context_search` | 26 searches before acting |
+
+Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
+
 ## Quick start
 
 Requires Node ≥ 20 and Python ≥ 3.9.
