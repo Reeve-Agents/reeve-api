@@ -6,7 +6,7 @@
 import { join, resolve } from "node:path";
 import { anchorFromEnv } from "@reeve/anchor";
 import { repoRoot } from "@reeve/pipeline";
-import { Ledger, merkleRoot } from "@reeve/receipts";
+import { anchorLeaves, Ledger, merkleRoot } from "@reeve/receipts";
 
 const a = anchorFromEnv();
 if (!a) {
@@ -14,7 +14,7 @@ if (!a) {
   process.exit(1);
 }
 const ledger = new Ledger(join(resolve(repoRoot, process.env.REEVE_HOME ?? ".reeve"), "ledger.jsonl"));
-const receipts = ledger.entries().flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+const receipts = anchorLeaves(ledger.entries());
 if (!receipts.length) {
   console.error("The ledger has no receipts yet.");
   process.exit(1);

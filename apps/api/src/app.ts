@@ -17,7 +17,7 @@ import { CardConversionError, costUsd, fxRate, LLMOutputError, LLMRefusalError, 
 import { genericScenario, rentScenario, repoRoot, runAttempt, runOperate, tenantsFromRecords } from "@reeve/pipeline";
 import { RailConfigError, SubAccountRequiredError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
 import type { ChainAnchor } from "@reeve/anchor";
-import { type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
+import { anchorLeaves, type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
 import type { Sandbox } from "@reeve/sandbox";
 import { dueTarget, memoOf, schedulerView, type Scheduled, type SchedulerConfig } from "./scheduler";
 import { newId, type DatasetRecord, type RulebookRecord, type RunRecord, type Store, type UsageRecord } from "./store";
@@ -433,7 +433,7 @@ export function createApp(rawDeps: AppDeps) {
         run.receipt = attempt.receipt;
         const entry = ledger.append({ kind: "receipt", at: attempt.receipt.created_at, receipt_hash: attempt.receipt.receipt_hash, run_id: run.id, verdict: attempt.verdict.status });
         run.ledgerSeq = entry.seq;
-        const receipts = ledger.entries().flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+        const receipts = anchorLeaves(ledger.entries());
         const root = merkleRoot(receipts);
         const anchor = ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: root, leaves: receipts.length, anchor: "local-ledger" });
         say(`receipt ${attempt.receipt.receipt_hash.slice(0, 16)}… → ledger #${entry.seq}; merkle root ${root.slice(0, 16)}… → ledger #${anchor.seq}`);
@@ -474,7 +474,7 @@ export function createApp(rawDeps: AppDeps) {
 
   app.post("/ledger/anchor", async (c) => {
     if (!deps.anchor) return c.json({ error: "no anchor wallet: run `npm run anchor:wallet`, fund the address from the testnet faucet, restart the API" }, 409);
-    const receipts = ledger.entries().flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+    const receipts = anchorLeaves(ledger.entries());
     if (receipts.length === 0) return c.json({ error: "no receipts to anchor yet" }, 409);
     const root = merkleRoot(receipts);
     let published;
@@ -503,7 +503,7 @@ export function createApp(rawDeps: AppDeps) {
     const entries = ledger.entries();
     const entry = entries.find((e) => e.seq === seq);
     if (!entry || entry.kind !== "anchor") return c.json({ error: "no anchor entry at that position" }, 404);
-    const receipts = entries.filter((e) => e.seq < seq).flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+    const receipts = anchorLeaves(entries.filter((e) => e.seq < seq));
     const local = merkleRoot(receipts.slice(0, entry.leaves)) === entry.merkle_root && ledger.verify() === null;
     if (!entry.tx) return c.json({ seq, local, onChain: null, reason: "anchored in the local ledger only" });
     if (!deps.anchor || deps.anchor.chainName !== entry.anchor) return c.json({ error: `this API has no ${entry.anchor} anchor wallet to read with` }, 409);
