@@ -4,3 +4,4 @@ export * from "./playbook";
 export * from "./validator";
 export * from "./crew";
 export * from "./kamar";
+export * from "./konten";
