@@ -9,18 +9,19 @@ import {
 import { Hono } from "hono";
 import { parseSop } from "@reeve/builder";
 import { prepareAudit } from "@reeve/auditor";
-import { contactsFromRecords, minimarketPack, type SupplierContacts, withPayments, GenericOperator, NeedsPasskeyError, newGenericOperation, newOperation, Operator, OperatorError, type GenericOperationRecord, type OperationRecord, type RentOperationRecord } from "@reeve/broker";
+import { contactsFromRecords, markPreparedSent, minimarketPack, type SupplierContacts, withPayments, GenericOperator, NeedsPasskeyError, newGenericOperation, newOperation, Operator, OperatorError, type GenericOperation, type GenericOperationRecord, type OperationRecord, type RentOperationRecord } from "@reeve/broker";
 import { AppCatalog, inferFields, parseCsv, type ConnectorRegistry } from "@reeve/connectors";
 import { compareRuns, diffRulebooks, packOf, PackId, Rulebook, validateRulebook, type AnyScenario, type StockScenario, type Tenant } from "@reeve/core";
 import { PACKS } from "@reeve/core/packs";
-import { CardConversionError, LLMOutputError, LLMRefusalError, UnknownProviderError, type ProviderRegistry } from "@reeve/llm";
+import { CardConversionError, costUsd, fxRate, LLMOutputError, LLMRefusalError, UnknownProviderError, type LLMUsage, type ProviderRegistry, type UsagePhase } from "@reeve/llm";
 import { genericScenario, rentScenario, repoRoot, runAttempt, runOperate, tenantsFromRecords } from "@reeve/pipeline";
 import { RailConfigError, SubAccountRequiredError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
 import type { ChainAnchor } from "@reeve/anchor";
 import { type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
 import type { Sandbox } from "@reeve/sandbox";
 import { dueTarget, memoOf, schedulerView, type Scheduled, type SchedulerConfig } from "./scheduler";
-import { newId, type DatasetRecord, type RulebookRecord, type RunRecord, type Store } from "./store";
+import { newId, type DatasetRecord, type RulebookRecord, type RunRecord, type Store, type UsageRecord } from "./store";
+import { summarize } from "./usage";
 
 export interface AppDeps {
   store: Store;
@@ -54,6 +55,10 @@ export interface AppDeps {
   operatorModel?: string;
   /** Secret Telegram sends in x-telegram-bot-api-secret-token on webhook calls (TELEGRAM_WEBHOOK_SECRET). Unset: the Telegram webhook is off. */
   telegramWebhookSecret?: string;
+  /** This workspace's id, written on every cost-meter record. */
+  account?: string;
+  /** Where REEVE_USD_IDR and REEVE_PRICE_OVERRIDES are read from (default process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 const CHALLENGE_TTL_MS = 5 * 60_000;
@@ -66,6 +71,43 @@ export function createApp(rawDeps: AppDeps) {
   const deps: AppDeps = { ...rawDeps, connectors: withPayments(rawDeps.connectors, rawDeps.rails, (id) => railFor(id)) };
   const { store, ledger } = deps;
   const app = new Hono().basePath("/api");
+
+  // ── Cost meter: every model call's tokens, from the provider's own usage block, tagged with where it happened. ──
+  const env = deps.env ?? process.env;
+  const recordUsage = (phase: UsagePhase, u: LLMUsage, tags: { rulebookId?: string; operationId?: string } = {}): UsageRecord => {
+    const rec: UsageRecord = {
+      id: newId("use"),
+      at: new Date().toISOString(),
+      phase,
+      provider: u.provider,
+      model: u.model,
+      inputTokens: u.inputTokens,
+      outputTokens: u.outputTokens,
+      cacheWriteTokens: u.cacheWriteTokens,
+      cacheReadTokens: u.cacheReadTokens,
+      usd: costUsd(u, env),
+      ...(tags.rulebookId ? { rulebookId: tags.rulebookId } : {}),
+      ...(tags.operationId ? { operationId: tags.operationId } : {}),
+      ...(deps.account ? { account: deps.account } : {}),
+    };
+    (store.data.usage ??= []).push(rec);
+    store.save();
+    return rec;
+  };
+  /**
+   * A Builder call's usage is written the moment the reply is in (so tokens spent on a refused or unusable reply
+   * are counted too); the rulebook it produced does not have an id yet, so `tag` adds it afterwards.
+   */
+  const builderMeter = () => {
+    const mine: UsageRecord[] = [];
+    return {
+      onUsage: (u: LLMUsage) => void mine.push(recordUsage("builder_compile", u)),
+      tag: (rulebookId: string) => {
+        for (const r of mine) r.rulebookId = rulebookId;
+        if (mine.length) store.save();
+      },
+    };
+  };
 
   // One sandbox job at a time (CreateOS Free plan: 1 concurrent sandbox).
   let queue: Promise<void> = Promise.resolve();
@@ -243,7 +285,9 @@ export function createApp(rawDeps: AppDeps) {
       if (problems.length) return c.json({ error: `these rows are not tenants yet: ${problems.slice(0, 4).join("; ")}` }, 400);
     }
     const provider = deps.providers.get(body.provider || undefined);
-    let parsed = await parseSop(provider, text, pack.data, generic ? hintsFor(datasetId) : undefined);
+    const meter = builderMeter();
+    const metered = { onUsage: meter.onUsage };
+    let parsed = await parseSop(provider, text, pack.data, generic ? hintsFor(datasetId) : undefined, metered);
     let toolChecks = generic ? await checkTools(parsed.rulebook) : undefined;
     // Build time: if the model named a tool no connected service has (or left out what it needs), look up
     // the real tools for those rules on the connected services and let it try once more with them.
@@ -253,7 +297,7 @@ export function createApp(rawDeps: AppDeps) {
       const found = (await Promise.all(titles.map((t) => deps.connectors.suggestTools(t, 4)))).flat();
       const tools = [...new Map(found.map((t) => [t.slug, t])).values()];
       if (tools.length) {
-        const retry = await parseSop(provider, text, pack.data, { ...hintsFor(datasetId), tools });
+        const retry = await parseSop(provider, text, pack.data, { ...hintsFor(datasetId), tools }, metered);
         const retryChecks = await checkTools(retry.rulebook);
         const bad = (cs: typeof retryChecks) => cs.filter((t) => t.status === "not_found" || t.status === "missing_args").length;
         if (bad(retryChecks) < gaps.length) {
@@ -263,6 +307,7 @@ export function createApp(rawDeps: AppDeps) {
       }
     }
     const id = newId("rb");
+    meter.tag(id);
     store.data.rulebooks[id] = {
       id,
       sop: text,
@@ -313,6 +358,7 @@ export function createApp(rawDeps: AppDeps) {
     if (!parent) return c.json({ error: "not found" }, 404);
     const body = await c.req.json<{ text?: string; rulebook?: unknown; provider?: string }>();
     const pack = packOf(parent.rulebook);
+    const meter = builderMeter();
     let rulebook: Rulebook;
     let provider: string;
     if (body.rulebook !== undefined) {
@@ -323,13 +369,17 @@ export function createApp(rawDeps: AppDeps) {
       provider = "edited by the owner";
     } else {
       if (!body.text || body.text.trim().length < 20) return c.json({ error: "the revised SOP text is required" }, 400);
-      const parsed = await parseSop(deps.providers.get(body.provider || undefined), body.text, pack, pack === "generic" ? hintsFor(parent.datasetId) : undefined);
+      const parsed = await parseSop(deps.providers.get(body.provider || undefined), body.text, pack, pack === "generic" ? hintsFor(parent.datasetId) : undefined, { onUsage: meter.onUsage });
       rulebook = parsed.rulebook;
       provider = parsed.provider;
     }
     const diff = diffRulebooks(parent.rulebook, rulebook);
-    if (diff.length === 0) return c.json({ error: "no rule changed in this revision" }, 409);
+    if (diff.length === 0) {
+      meter.tag(parent.id); // the model was still called: the cost belongs to the version it was asked about
+      return c.json({ error: "no rule changed in this revision" }, 409);
+    }
     const id = newId("rb");
+    meter.tag(id);
     store.data.rulebooks[id] = {
       id,
       sop: body.text ?? parent.sop,
@@ -614,12 +664,12 @@ export function createApp(rawDeps: AppDeps) {
       save: () => store.save(),
       // Bills, reminders and notices go out through the same connector registry the generic pack uses.
       send: (call) => deps.connectors.execute(call.connector, call.tool, call.args),
-      ...llmHooks(),
+      ...llmHooks({ rulebookId: op.rulebookId, operationId: op.id }),
     });
   };
 
-  /** Drafting and reply reading, only when switched on and the default provider can complete text. */
-  const llmHooks = () => {
+  /** Drafting and reply reading, only when switched on and the default provider can complete text. Each call's tokens go to the cost meter under `tags`. */
+  const llmHooks = (tags: { rulebookId: string; operationId: string }) => {
     let complete: ReturnType<typeof completerOf> = null;
     try {
       // Cheap by default: Haiku-class, never the default Opus/Sonnet. Another model only when the owner names one.
@@ -630,7 +680,7 @@ export function createApp(rawDeps: AppDeps) {
         const fallback = deps.providers.get();
         provider = deps.operatorModel || !/^anthropic:claude-(opus|sonnet)/.test(fallback.name) ? fallback : undefined;
       }
-      complete = completerOf(provider, deps.operatorLlm === true);
+      complete = completerOf(provider, deps.operatorLlm === true, (phase, u) => recordUsage(phase, u, tags));
     } catch {
       complete = null;
     }
@@ -684,6 +734,38 @@ export function createApp(rawDeps: AppDeps) {
     return op ? c.json(withScheduler(op)) : c.json({ error: "not found" }, 404);
   });
 
+  // The owner says they sent a prepared WhatsApp message from their own phone. Reeve cannot see WhatsApp, so this is the
+  // owner's word, written on the ledger as such. Marking the same message again changes nothing (`changed` is false).
+  app.post("/operations/:id/messages/:messageId/sent", (c) => {
+    const rent = store.data.operations[c.req.param("id")] as RentOperationRecord | undefined;
+    const op = rent ?? (store.data.genericOperations[c.req.param("id")] as GenericOperation | undefined);
+    if (!op) return c.json({ error: "not found" }, 404);
+    if (!op.prepared?.some((m) => m.id === c.req.param("messageId"))) return c.json({ error: "no such prepared message" }, 404);
+    const now = new Date();
+    const { message, changed } = markPreparedSent(op.prepared, c.req.param("messageId"), {
+      now,
+      record: (b) => ledger.append({ kind: "operation", at: now.toISOString(), operation_id: op.id, rail: rent ? rent.rail : "connectors", receipt_hash: op.receiptHash, ...b }),
+      save: () => store.save(),
+    });
+    return c.json({ message, operation: op, changed });
+  });
+
+  // ── Cost meter: what the model calls cost (tokens and price from the providers' own numbers), against the steps plain code ran. ──
+  const usageOf = (q: { rulebookId?: string; operationId?: string; month?: string }) =>
+    summarize(store.data.usage ?? [], [...Object.values(store.data.operations), ...Object.values(store.data.genericOperations)], q, new Date(), fxRate(env));
+
+  // Whole workspace, or narrowed with ?rulebookId= and/or ?operationId=; ?month=YYYY-MM picks the month (default: this month, Jakarta time).
+  app.get("/usage", (c) => {
+    const month = c.req.query("month");
+    if (month && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return c.json({ error: "month must look like 2026-11" }, 400);
+    return c.json(usageOf({ rulebookId: c.req.query("rulebookId") || undefined, operationId: c.req.query("operationId") || undefined, month: month || undefined }));
+  });
+
+  app.get("/rulebooks/:id/usage", (c) => {
+    if (!store.data.rulebooks[c.req.param("id")]) return c.json({ error: "not found" }, 404);
+    return c.json(usageOf({ rulebookId: c.req.param("id") }));
+  });
+
   // Start a run of the approved rulebook on a rail. Nothing is billed until the clock advances.
   app.post("/rulebooks/:id/operations", async (c) => {
     const rb = store.data.rulebooks[c.req.param("id")];
@@ -697,12 +779,14 @@ export function createApp(rawDeps: AppDeps) {
     }
     if (packOf(rb.rulebook) === "minimarket") {
       // Purchase orders go to suppliers through the connector registry (Telegram / Gmail, or the log for a supplier without a contact).
-      const body = await c.req.json<{ suppliers?: Record<string, { telegram_chat_id?: unknown; email?: unknown }> }>().catch(() => ({}) as { suppliers?: Record<string, { telegram_chat_id?: unknown; email?: unknown }> });
-      const suppliers: Record<string, { telegram_chat_id?: string; email?: string }> = {};
+      type SupplierBody = Record<string, { telegram_chat_id?: unknown; email?: unknown; whatsapp?: unknown }>;
+      const body = await c.req.json<{ suppliers?: SupplierBody }>().catch(() => ({}) as { suppliers?: SupplierBody });
+      const suppliers: Record<string, { telegram_chat_id?: string; email?: string; whatsapp?: string }> = {};
       for (const [id, v] of Object.entries(body.suppliers ?? {})) {
         const telegram = typeof v?.telegram_chat_id === "string" || typeof v?.telegram_chat_id === "number" ? String(v.telegram_chat_id).trim() : "";
         const email = typeof v?.email === "string" ? v.email.trim() : "";
-        if (telegram || email) suppliers[id] = { ...(telegram ? { telegram_chat_id: telegram } : {}), ...(email ? { email } : {}) };
+        const whatsapp = typeof v?.whatsapp === "string" || typeof v?.whatsapp === "number" ? String(v.whatsapp).trim() : "";
+        if (telegram || email || whatsapp) suppliers[id] = { ...(telegram ? { telegram_chat_id: telegram } : {}), ...(email ? { email } : {}), ...(whatsapp ? { whatsapp } : {}) };
       }
       const op = { ...newGenericOperation({ id: newId("op"), rulebookId: rb.id, receiptHash: rb.approval.receiptHash, datasetId: "sample", startDate: deps.scenario("minimarket").start_date }), suppliers };
       store.data.genericOperations[op.id] = op;

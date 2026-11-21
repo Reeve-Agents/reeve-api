@@ -1,5 +1,6 @@
 import type { AnyScenario, GenericOperationRecord, GenericScenario, HeldAction, Rulebook, SentAction, SimEvent } from "@reeve/core";
 import { addDays, dayOffset, NeedsPasskeyError, OperatorError, type OperatorDeps } from "./index";
+import { prepareWhatsApp, WHATSAPP_CHANNEL, type PreparedMessage, type WhatsAppOffer } from "./messages";
 
 /**
  * The Operator for the generic pack. The approved rules run in the sandbox over the owner's current
@@ -9,6 +10,9 @@ import { addDays, dayOffset, NeedsPasskeyError, OperatorError, type OperatorDeps
  */
 
 export type { GenericOperationRecord, HeldAction, SentAction } from "@reeve/core";
+
+/** A generic operation with the messages Reeve prepared as WhatsApp links (purchase orders to suppliers with a WhatsApp number). */
+export type GenericOperation = GenericOperationRecord & { prepared?: PreparedMessage[] };
 
 export interface GenericDeps {
   runRules: (scenario: AnyScenario) => Promise<{ events: SimEvent[]; violations: string[] }>;
@@ -83,8 +87,9 @@ export class GenericOperator {
   private async handle(e: SimEvent) {
     const op = this.op;
     const base = { date: e.date, key: e.tenant_id, rule: e.rule ?? "?" };
+    const offer = (e as SimEvent & { whatsapp?: WhatsAppOffer }).whatsapp;
     if (e.type === "action") {
-      await this.send({ ...base, tool: e.tool!, connector: (e as SimEvent & { connector?: string }).connector ?? "log", args: e.args ?? {}, amount: e.amount });
+      await this.send({ ...base, tool: e.tool!, connector: (e as SimEvent & { connector?: string }).connector ?? "log", args: e.args ?? {}, amount: e.amount }, offer);
     } else if (e.type === "approval_request") {
       const id = `ap-${e.tenant_id}-${e.date}-${op.held.length + 1}`;
       const rule = this.rulebook.cards.find((c) => c.id === e.rule);
@@ -99,7 +104,9 @@ export class GenericOperator {
         text: `${e.tool} for ${e.tenant_id} is about ${rp(e.amount ?? 0)}, above your limit. Send it?`,
         status: "open",
         needsPasskey: true,
-      });
+        // Kept with the held action: a WhatsApp link is prepared only if the owner approves it.
+        ...(offer ? { whatsapp: offer } : {}),
+      } as HeldAction);
       this.deps.record({ event: "exception_raised", tenant: e.tenant_id, amount: e.amount, ref: id });
     } else if (e.type === "blocked") {
       op.held.push({ id: `bl-${e.tenant_id}-${e.date}-${op.held.length + 1}`, ...base, kind: "blocked", tool: e.tool, text: `${e.tool} for ${e.tenant_id} was not sent: the rulebook forbids it.`, status: "noted", needsPasskey: false });
@@ -110,18 +117,47 @@ export class GenericOperator {
     }
   }
 
-  private async send(a: Omit<SentAction, "ok" | "via" | "error">) {
+  /**
+   * The message is ready as a WhatsApp link for the owner to send from their own WhatsApp. Returns true when it was
+   * (the action is recorded as done by "whatsapp_link", never as sent); otherwise the reason the number was unusable, if any.
+   */
+  private prepare(a: Omit<SentAction, "ok" | "via" | "error">, offer: WhatsAppOffer, why?: string): true | { skipped?: string } {
+    const op = this.op as GenericOperation;
+    const ref = `${offer.message.kind}:${a.key}`;
+    const link = prepareWhatsApp(offer.message, { whatsapp: offer.number }, { id: `wa-${a.key}-${(op.prepared?.length ?? 0) + 1}`, at: (this.deps.now ?? (() => new Date()))().toISOString(), tenant: a.key, ref });
+    if (!link || "skipped" in link) return { skipped: link?.skipped };
+    (op.prepared ??= []).push(link.prepared);
+    op.sent.push({ ...a, ok: true, via: WHATSAPP_CHANNEL, error: `prepared as a WhatsApp link, not sent${why ? `: ${why}` : ""}` });
+    this.deps.record({ event: "message_prepared", tenant: a.key, amount: a.amount, ref, channel: WHATSAPP_CHANNEL });
+    this.deps.save();
+    return true;
+  }
+
+  private async send(a: Omit<SentAction, "ok" | "via" | "error">, offer?: WhatsAppOffer) {
     if (!this.allowed.has(a.tool)) {
       this.op.sent.push({ ...a, ok: false, error: `${a.tool} is not in the approved rulebook` });
       this.deps.record({ event: "blocked", tenant: a.key, ref: a.tool });
       return;
     }
+    // No automatic channel on file (the Log tool): a WhatsApp link, when the contact has a valid number, instead of a log line.
+    let skipped: string | undefined;
+    if (offer && a.tool === "LOG") {
+      const done = this.prepare(a, offer);
+      if (done === true) return;
+      skipped = done.skipped;
+    }
     let r: Awaited<ReturnType<GenericDeps["execute"]>> = await this.deps.execute(a.connector, a.tool, a.args).catch((err) => ({ ok: false, connector: "none", error: err instanceof Error ? err.message : String(err) }));
-    // A message that cannot be delivered (no account connected, no key) is kept on the Log connector, as in the rent path; the reason stays on the action.
+    // A message that cannot be delivered (no account connected, no key) becomes a WhatsApp link when the contact has a number, else is kept on the Log connector, as in the rent path; the reason stays on the action.
     if (!r.ok && /SEND_MESSAGE|SEND_EMAIL/.test(a.tool)) {
       const reason = r.error ?? "not delivered";
-      const logged = await this.deps.execute("log", "LOG", { tool: a.tool, rule: a.rule, key: a.key, ...a.args, not_sent_because: reason }).catch(() => null);
-      if (logged?.ok) r = { ok: true, connector: "log", error: `not sent, logged instead: ${reason}` };
+      if (offer) {
+        const done = this.prepare(a, offer, reason);
+        if (done === true) return;
+        skipped = done.skipped;
+      }
+      const note = skipped ? `${reason}; WhatsApp link skipped: ${skipped}` : reason;
+      const logged = await this.deps.execute("log", "LOG", { tool: a.tool, rule: a.rule, key: a.key, ...a.args, not_sent_because: note }).catch(() => null);
+      if (logged?.ok) r = { ok: true, connector: "log", error: `not sent, logged instead: ${note}` };
     }
     // A payment tool hands back the hosted link; keep it with the action so the owner (and the tenant message) can use it.
     const result = r.ok && r.data && typeof r.data === "object" && "pay_url" in r.data ? { pay_url: (r.data as { pay_url: string | null }).pay_url, invoice_id: (r.data as { invoice_id?: string }).invoice_id } : undefined;
@@ -142,7 +178,7 @@ export class GenericOperator {
     }
     if (!approved) throw new NeedsPasskeyError("sending an action above the limit needs the owner's passkey");
     h.status = "approved";
-    await this.send({ date: h.date, key: h.key, rule: h.rule, tool: h.tool!, connector: h.connector ?? "log", args: h.args ?? {}, amount: h.amount });
+    await this.send({ date: h.date, key: h.key, rule: h.rule, tool: h.tool!, connector: h.connector ?? "log", args: h.args ?? {}, amount: h.amount }, (h as HeldAction & { whatsapp?: WhatsAppOffer }).whatsapp);
     return h;
   }
 

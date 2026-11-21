@@ -1,7 +1,8 @@
 import { packOf, Rulebook, type PackId } from "@reeve/core";
 import { AnthropicProvider, CLAUDE_MODELS } from "./anthropic";
 import { OpenAICompatibleProvider, type OpenAICompatibleOptions } from "./openai-compatible";
-import type { LLMProvider } from "./provider";
+import type { LLMProvider, SopHints, UsageListener } from "./provider";
+import { noUsage } from "./usage";
 
 /** Replays the hand-written rulebook for the pack. Offline and free; it ignores the SOP text. */
 export class FixtureProvider implements LLMProvider {
@@ -12,9 +13,10 @@ export class FixtureProvider implements LLMProvider {
     for (const rb of Array.isArray(rulebooks) ? rulebooks : [rulebooks]) this.byPack.set(packOf(rb), rb);
   }
 
-  async parseSop(_sop: string, pack: PackId = "rent-collection"): Promise<Rulebook> {
+  async parseSop(_sop: string, pack: PackId = "rent-collection", _hints?: SopHints, opts?: { onUsage?: UsageListener }): Promise<Rulebook> {
     const rb = this.byPack.get(pack);
     if (!rb) throw new Error(`no sample rulebook for the ${pack} pack`);
+    opts?.onUsage?.(noUsage(this.name, "fixture")); // no model is called: zero tokens, zero cost
     return Rulebook.parse(structuredClone(rb));
   }
 }

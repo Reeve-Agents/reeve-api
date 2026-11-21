@@ -1,4 +1,4 @@
-import { extractJson, type LLMProvider } from "@reeve/llm";
+import { extractJson, type LLMProvider, type LLMUsage, type UsagePhase } from "@reeve/llm";
 import { messageFor, REPLY_INTENTS, type Message, type ReplyClassifier } from "@reeve/broker";
 
 /**
@@ -6,12 +6,16 @@ import { messageFor, REPLY_INTENTS, type Message, type ReplyClassifier } from "@
  * the rules say whether, when and to whom; the model only words the message and reads the reply.
  * Off unless REEVE_OPERATOR_LLM=on, because both send tenant names and amounts to the model provider.
  */
-export type Complete = (system: string, user: string, opts?: { maxTokens?: number }) => Promise<string>;
+export type Complete = (system: string, user: string, opts?: { maxTokens?: number; purpose?: "draft" | "classify" }) => Promise<string>;
 
-/** The provider's text completion, or null when it has none (the offline sample provider). */
-export function completerOf(provider: LLMProvider | undefined, enabled: boolean): Complete | null {
+/** Where one Operator model call's tokens go: the cost meter. */
+export type UsageSink = (phase: Extract<UsagePhase, "operator_draft" | "operator_classify">, usage: LLMUsage) => void;
+
+/** The provider's text completion, or null when it has none (the offline sample provider). Every call's tokens go to `onUsage`. */
+export function completerOf(provider: LLMProvider | undefined, enabled: boolean, onUsage?: UsageSink): Complete | null {
   if (!enabled || !provider?.completeText) return null;
-  return provider.completeText.bind(provider);
+  const complete = provider.completeText.bind(provider);
+  return (system, user, opts) => complete(system, user, { maxTokens: opts?.maxTokens, onUsage: (u) => onUsage?.(opts?.purpose === "classify" ? "operator_classify" : "operator_draft", u) });
 }
 
 const DRAFT_SYSTEM = [
@@ -45,7 +49,7 @@ export const drafterFor = (complete: Complete, tone = "ramah dan sopan", maxCall
       if (calls >= maxCalls) return null;
       calls++;
       const original = messageFor(msg.kind, { name: "{{name}}", room: "{{room}}", amount: 0, payUrl: msg.facts.payUrl ? "{{link}}" : undefined }).body.replaceAll(rpText(0), "{{amount}}");
-      template = complete(DRAFT_SYSTEM, `Tone: ${tone}\nMessage type: ${msg.kind}\nKeep the placeholders {{name}} {{room}} {{amount}} {{link}} exactly as written, wherever they appear.\nOriginal message:\n${original}`, { maxTokens: 600 }).then((text) => {
+      template = complete(DRAFT_SYSTEM, `Tone: ${tone}\nMessage type: ${msg.kind}\nKeep the placeholders {{name}} {{room}} {{amount}} {{link}} exactly as written, wherever they appear.\nOriginal message:\n${original}`, { maxTokens: 600, purpose: "draft" }).then((text) => {
         const out = text.trim();
         const ok = out && TOKENS.every((t) => !original.includes(`{{${t}}}`) || out.includes(`{{${t}}}`));
         return ok ? out : null;
@@ -74,7 +78,7 @@ export const classifierFor = (complete: Complete, maxCalls = MAX_CALLS_PER_ADVAN
 
 // 600 tokens: a model that adds a sentence or thinks first must still have room for the JSON.
 const classify: (complete: Complete, ...args: Parameters<ReplyClassifier>) => ReturnType<ReplyClassifier> = async (complete, text, ctx) => {
-  const raw = await complete(CLASSIFY_SYSTEM, `Today: ${ctx.today}\nOpen amount: ${ctx.amount}\nReply:\n<<<\n${text}\n>>>`, { maxTokens: 600 });
+  const raw = await complete(CLASSIFY_SYSTEM, `Today: ${ctx.today}\nOpen amount: ${ctx.amount}\nReply:\n<<<\n${text}\n>>>`, { maxTokens: 600, purpose: "classify" });
   const parsed = extractJson(raw) as { intent?: unknown; promised_date?: unknown };
   const intent = typeof parsed.intent === "string" && (REPLY_INTENTS as readonly string[]).includes(parsed.intent) ? parsed.intent : "unclear";
   return { intent, promised_date: typeof parsed.promised_date === "string" ? parsed.promised_date : null };

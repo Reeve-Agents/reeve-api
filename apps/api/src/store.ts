@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 import type { GenericOperationRecord, OperationRecord } from "@reeve/broker";
 import type { ToolCheck } from "@reeve/connectors";
 import type { Finding, JobResults, Receipt, Rulebook, RulebookIssue, Verdict } from "@reeve/core";
+import type { UsagePhase } from "@reeve/llm";
 
 export interface RulebookRecord {
   id: string;
@@ -62,6 +63,26 @@ export interface PasskeyRecord {
   createdAt: string;
 }
 
+/** One model call, as the provider's own usage block reported it. Nothing here is estimated. */
+export interface UsageRecord {
+  id: string;
+  at: string;
+  phase: UsagePhase;
+  /** e.g. "anthropic:claude-haiku-5-5"; "fixture" for the offline sample (zero tokens, zero cost). */
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  /** USD at the price in force when the call was made; null when the provider has no known price ("tidak diketahui"). */
+  usd: number | null;
+  rulebookId?: string;
+  operationId?: string;
+  /** The workspace (account) whose call it was. */
+  account?: string;
+}
+
 export interface StoreData {
   ownerUserId: string; // base64url, stable WebAuthn user handle
   rulebooks: Record<string, RulebookRecord>;
@@ -73,6 +94,8 @@ export interface StoreData {
   /** Owners' records for generic SOPs (a CSV upload or a connector read). */
   datasets: Record<string, DatasetRecord>;
   passkeys: PasskeyRecord[];
+  /** Every model call this workspace made (the cost meter). Older stores have none. */
+  usage?: UsageRecord[];
   /** This owner's own account on a per-merchant rail (Xendit xenPlatform sub-account id), so the money settles there, never in Reeve's balance. */
   railAccounts?: Record<string, string>;
   challenges: {
@@ -101,6 +124,7 @@ export class Store {
       this.data.operations ??= {};
       this.data.genericOperations ??= {};
       this.data.datasets ??= {};
+      this.data.usage ??= [];
       this.data.challenges.refunds ??= {};
     } else {
       this.data = {
@@ -110,6 +134,7 @@ export class Store {
         operations: {},
         genericOperations: {},
         datasets: {},
+        usage: [],
         passkeys: [],
         challenges: { approvals: {}, refunds: {} },
       };

@@ -77,6 +77,7 @@ const { app, openAll } = await createAccountsApp({
       operatorLlm: ["on", "1", "true", "yes"].includes((process.env.REEVE_OPERATOR_LLM ?? "").toLowerCase()),
       operatorModel: process.env.REEVE_OPERATOR_MODEL || undefined,
       telegramWebhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined,
+      account: id,
       onPasskeyAdded,
     }).fetch,
 });

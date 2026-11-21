@@ -1,7 +1,7 @@
 import type { SimEvent, StockScenario } from "@reeve/core";
 import type { GenericDeps } from "./generic";
 import { dayOffset } from "./index";
-import { messageFor, RENT_MESSAGE_TOOLS, toolCallFor, type Contact } from "./messages";
+import { messageFor, RENT_MESSAGE_TOOLS, toolCallFor, type Contact, type WhatsAppOffer } from "./messages";
 
 /**
  * Minimarket purchase orders on the generic Operator path. The approved minimarket rules (reorder
@@ -30,7 +30,9 @@ export function minimarketPack(scenario: StockScenario, suppliers: SupplierConta
       const msg = messageFor("purchase_order", { name: `Supplier ${supplier}`, room: nameOf(e.tenant_id), amount: e.amount ?? 0, qty: Number(qtyText) || undefined });
       const call = toolCallFor(msg, suppliers[supplier]);
       const args = Object.fromEntries(Object.entries(call.args).map(([k, v]) => [k, String(v)]));
-      return { ...e, type: e.type === "po_created" ? "action" : "approval_request", rule: "PO", tool: call.tool, args, connector: call.connector } as SimEvent;
+      // The supplier's WhatsApp number rides along; it is used only when the order really goes out (an order held for approval waits).
+      const whatsapp: WhatsAppOffer | undefined = suppliers[supplier]?.whatsapp ? { number: suppliers[supplier]!.whatsapp!, message: msg } : undefined;
+      return { ...e, type: e.type === "po_created" ? "action" : "approval_request", rule: "PO", tool: call.tool, args, connector: call.connector, ...(whatsapp ? { whatsapp } : {}) } as SimEvent;
     },
   };
 }

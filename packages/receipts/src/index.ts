@@ -120,10 +120,27 @@ export interface OperationBody {
   at: string;
   operation_id: string;
   rail: string;
-  event: "invoice_created" | "payment_received" | "message_logged" | "message_sent" | "reply_received" | "reply_actioned" | "exception_raised" | "refund_issued" | "credit_kept" | "blocked" | "rules_upgraded";
+  event:
+    | "invoice_created"
+    | "payment_received"
+    | "message_logged"
+    | "message_sent"
+    /** A message the owner sends from their own WhatsApp: Reeve only made the link (channel "whatsapp_link"), nothing was sent. */
+    | "message_prepared"
+    /** The owner says they sent a prepared message. Reeve cannot see WhatsApp: this is the owner's word. */
+    | "message_sent_by_owner"
+    | "reply_received"
+    | "reply_actioned"
+    | "exception_raised"
+    | "refund_issued"
+    | "credit_kept"
+    | "blocked"
+    | "rules_upgraded";
   tenant?: string;
   amount?: number;
   ref?: string;
+  /** For message events: how the message travels (e.g. "whatsapp_link"). */
+  channel?: string;
   receipt_hash: string;
 }
 

@@ -1,14 +1,34 @@
 import type { OperationAction, OperationException, OperationInvoice, OperationPayment, OperationRecord, Rulebook, Scenario, SimEvent, Tenant } from "@reeve/core";
 import type { PaymentRail, RailEvent, RailInvoice } from "@reeve/rails";
 import type { OperationBody } from "@reeve/receipts";
-import { messageFor, toolCallFor, type Contact, type Message, type MessageFacts, type MessageKind, type ToolCall } from "./messages";
+import { messageFor, prepareWhatsApp, toolCallFor, WHATSAPP_CHANNEL, type Contact, type Message, type MessageFacts, type MessageKind, type PreparedMessage, type ToolCall } from "./messages";
 
 export { minimarketPack, type SupplierContacts } from "./minimarket";
 export { PAYMENT_TOOLS, PaymentsConnector, withPayments } from "./payments";
-export { contactsFromRecords, messageFor, RENT_MESSAGE_TOOLS, toolCallFor, type Contact, type Message, type MessageFacts, type MessageKind, type ToolCall } from "./messages";
+export {
+  contactsFromRecords,
+  messageFor,
+  normalisePhone,
+  prepareWhatsApp,
+  RENT_MESSAGE_TOOLS,
+  toolCallFor,
+  WHATSAPP_CHANNEL,
+  whatsappLink,
+  type Contact,
+  type Message,
+  type MessageFacts,
+  type MessageKind,
+  type PhoneCheck,
+  type PreparedMessage,
+  type ToolCall,
+  type WhatsAppOffer,
+} from "./messages";
 
-/** A rent operation with the contact details of its tenants (read from the owner's sheet when the run starts). */
-export type RentOperationRecord = OperationRecord & { contacts?: Record<string, Contact>; replies?: ReplyRecord[]; holds?: Record<string, string> };
+/**
+ * A rent operation with the contact details of its tenants (read from the owner's sheet when the run starts)
+ * and the messages Reeve prepared as WhatsApp links for the owner to send.
+ */
+export type RentOperationRecord = OperationRecord & { contacts?: Record<string, Contact>; replies?: ReplyRecord[]; holds?: Record<string, string>; prepared?: PreparedMessage[] };
 
 /** What the classifier made of a tenant's reply. Only these four exist; anything else is "unclear". */
 export const REPLY_INTENTS = ["promise_to_pay", "already_paid", "asks_relief", "unclear"] as const;
@@ -38,6 +58,8 @@ export type ReplyClassifier = (text: string, ctx: { name: string; room: string; 
 
 /** An action the Operator took that sent a real message. Core's union gains "sent"; until it ships, the value is cast. */
 const SENT = "sent" as OperationAction["outcome"];
+/** An action whose message is ready as a WhatsApp link but not sent. Cast for the same reason as SENT. */
+const PREPARED = "prepared" as OperationAction["outcome"];
 
 /**
  * The broker runs outside every sandbox and is the only part of Reeve that holds rail keys.
@@ -73,6 +95,25 @@ export interface OperatorDeps {
 
 export class OperatorError extends Error {}
 export class NeedsPasskeyError extends OperatorError {}
+
+/**
+ * The owner says they sent a prepared WhatsApp message. Marking it again changes nothing and records nothing more
+ * (`changed` is false). Reeve cannot see WhatsApp: this is the owner's word, recorded as such.
+ */
+export function markPreparedSent(
+  list: PreparedMessage[] | undefined,
+  id: string,
+  ctx: { now: Date; record: OperatorDeps["record"]; save: () => void },
+): { message: PreparedMessage; changed: boolean } {
+  const message = list?.find((m) => m.id === id);
+  if (!message) throw new OperatorError(`no prepared message ${id}`);
+  if (message.status === "sent_by_owner") return { message, changed: false };
+  message.status = "sent_by_owner";
+  message.sentAt = ctx.now.toISOString();
+  ctx.record({ event: "message_sent_by_owner", tenant: message.tenant, amount: message.amount, ref: message.ref, channel: message.channel });
+  ctx.save();
+  return { message, changed: true };
+}
 
 const DAY = 86_400_000;
 export const addDays = (date: string, n: number) => new Date(Date.parse(`${date}T00:00:00Z`) + n * DAY).toISOString().slice(0, 10);
@@ -188,7 +229,7 @@ export class Operator {
       }
     }
     op.clock = toDate;
-    this.say(`clock at ${toDate}: ${done.filter((a) => a.outcome === "invoiced").length} bills sent, ${done.filter((a) => a.outcome === SENT).length} reminders sent, ${done.filter((a) => a.outcome === "logged").length} messages logged, ${done.filter((a) => a.outcome === "raised").length} exceptions`);
+    this.say(`clock at ${toDate}: ${done.filter((a) => a.outcome === "invoiced").length} bills sent, ${done.filter((a) => a.outcome === SENT).length} reminders sent, ${done.filter((a) => a.outcome === "logged").length} messages logged, ${done.filter((a) => a.outcome === PREPARED).length} messages ready as WhatsApp links, ${done.filter((a) => a.outcome === "raised").length} exceptions`);
     return done;
   }
 
@@ -219,7 +260,7 @@ export class Operator {
         }
         const out = await this.notify(e.tenant_id, e.type, e.amount ?? 0, `${e.invoice_id}`, open?.payUrl);
         const what = e.type === "reminder" ? `reminder, ${rp(e.amount ?? 0)} still due` : "formal notice to vacate";
-        return { ...base, outcome: out.sent ? SENT : "logged", detail: `${this.name(e.tenant_id)}: ${what}. ${out.detail}` };
+        return { ...base, outcome: out.sent ? SENT : out.prepared ? PREPARED : "logged", detail: `${this.name(e.tenant_id)}: ${what}. ${out.detail}` };
       }
       case "credit":
       case "refund_request": {
@@ -263,10 +304,12 @@ export class Operator {
   }
 
   /**
-   * Tell the tenant. The channel is the tenant's Telegram chat, else their email, else the log; a send
-   * that fails (no connector key, no account connected) falls back to the Log connector and says so.
+   * Tell the tenant. The automatic channel is the tenant's Telegram chat, else their email. When neither delivers
+   * (none on file, nothing connected, or the send fails) and the tenant has a valid WhatsApp number, the message is
+   * prepared as a wa.me link for the owner to send from their own WhatsApp; that is never claimed as sent. Only
+   * then, or when the number is missing or invalid, it goes to the Log connector and says so.
    */
-  private async notify(tenant: string, kind: MessageKind, amount: number, invoice: string, payUrl?: string): Promise<{ sent: boolean; detail: string }> {
+  private async notify(tenant: string, kind: MessageKind, amount: number, invoice: string, payUrl?: string): Promise<{ sent: boolean; prepared?: boolean; detail: string }> {
     const t = this.op.tenants.find((x) => x.id === tenant);
     const facts: MessageFacts = { name: t?.name ?? tenant, room: t?.room ?? tenant, amount, payUrl, invoice };
     const msg = messageFor(kind, facts);
@@ -274,21 +317,30 @@ export class Operator {
       const drafted = await this.deps.draft(msg).catch(() => null);
       if (drafted && keepsFacts(drafted, facts)) msg.body = drafted;
     }
-    const call = toolCallFor(msg, (this.op as RentOperationRecord).contacts?.[tenant]);
+    const contact = (this.op as RentOperationRecord).contacts?.[tenant];
+    const call = toolCallFor(msg, contact);
     const ref = `${kind}:${invoice}`;
-    const log = async (why: string) => {
+    const fallback = async (why: string) => {
+      const op = this.op as RentOperationRecord;
+      const link = prepareWhatsApp(msg, contact, { id: `wa-${tenant}-${(op.prepared?.length ?? 0) + 1}`, at: this.now().toISOString(), tenant, ref });
+      if (link && "prepared" in link) {
+        (op.prepared ??= []).push(link.prepared);
+        this.deps.record({ event: "message_prepared", tenant, amount, ref, channel: WHATSAPP_CHANNEL });
+        return { sent: false, prepared: true, detail: `Message prepared as a WhatsApp link, not sent: ${why}. The owner sends it from their own WhatsApp.` };
+      }
+      const skipped = link && "skipped" in link ? `; WhatsApp link skipped: ${link.skipped}` : "";
       const logCall = toolCallFor(msg, undefined);
       await this.deps.send?.(logCall).catch(() => undefined);
-      this.deps.record({ event: "message_logged", tenant, amount, ref });
-      return { sent: false, detail: `Message logged, not sent: ${why}.` };
+      this.deps.record({ event: "message_logged", tenant, amount, ref: `${ref}${skipped}`.slice(0, 200) });
+      return { sent: false, detail: `Message logged, not sent: ${why}${skipped}.` };
     };
-    if (call.tool === "LOG" || !this.deps.send) return log(call.tool === "LOG" ? "no Telegram chat id or email for this tenant" : "no connector configured");
+    if (call.tool === "LOG" || !this.deps.send) return fallback(call.tool === "LOG" ? "no Telegram chat id or email for this tenant" : "no connector configured");
     const r = await this.deps.send(call).catch((err) => ({ ok: false, connector: "none", error: err instanceof Error ? err.message : String(err) }));
     if (r.ok && r.connector !== "log") {
       this.deps.record({ event: "message_sent", tenant, amount, ref: `${ref}@${call.tool}:${r.connector}`.slice(0, 200) });
       return { sent: true, detail: `${kind === "bill" ? "Bill" : "Message"} sent via ${call.tool} (${r.connector})${payUrl ? " with the payment link" : ""}.` };
     }
-    return log(r.error ? `${call.tool} failed (${r.error})` : `${call.tool} has no connected account`);
+    return fallback(r.error ? `${call.tool} failed (${r.error})` : `${call.tool} has no connected account`);
   }
 
   private async bill(tenant: string, key: string, kind: OperationInvoice["kind"], amount: number, description: string, dueInDays: number) {
@@ -510,4 +562,4 @@ export class Operator {
   }
 }
 
-export { GenericOperator, newGenericOperation, type GenericDeps, type GenericOperationRecord, type HeldAction, type SentAction } from "./generic";
+export { GenericOperator, newGenericOperation, type GenericDeps, type GenericOperation, type GenericOperationRecord, type HeldAction, type SentAction } from "./generic";
