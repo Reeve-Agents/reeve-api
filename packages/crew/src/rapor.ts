@@ -182,16 +182,17 @@ export function raporHtml(r: Rapor, opts: { explainUrl?: (receipt: string) => st
   const anchors = r.anchors.map((a) => `<li><code>${esc(a.merkle_root.slice(0, 16))}…</code> · ${a.leaves} leaves · ${esc(a.anchor)}${a.explorer ? ` · <a href="${esc(a.explorer)}">tx</a>` : ""}</li>`).join("") || `<li>${t("Belum ada anchor.", "No anchor yet.")}</li>`;
   return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rapor Usaha · ${esc(r.workspace)}</title>
 <style>
-:root{--bg:#f6f5f1;--ink:#1f2421;--mute:#6b706c;--fill:#ebe8e0;--accent:#3e6b5a;--bad:#a4442f}
-@media (prefers-color-scheme:dark){:root{--bg:#171a18;--ink:#e8e6e0;--mute:#9aa09b;--fill:#232825;--accent:#8cc0a8;--bad:#e08a74}}
+:root{--bg:#000b16;--ink:#f6f7ed;--mute:#b9bdb4;--fill:#001f3f;--fill2:#012a52;--accent:#dbe64c;--on-accent:#001f3f;--blue:#1e488f;--link:#a9c1f2;--bad:#ff9b94;--sep:#1c2f45}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,system-ui,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
 h1{font-size:28px;margin:0 0 4px}h2{font-size:18px;margin:32px 0 8px}.mute{color:var(--mute)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px;margin-top:16px}
 .tile{background:var(--fill);border-radius:12px;padding:12px}.tile b{display:block;font-size:22px}
-table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:8px 6px;vertical-align:top}tr:nth-child(even){background:var(--fill)}
-.why{max-width:420px}.bad{color:var(--bad)}a{color:var(--accent)}code{font-size:12px}
-.wrap{overflow-x:auto}button{background:var(--accent);color:var(--bg);border:0;border-radius:999px;padding:6px 14px;font:inherit;cursor:pointer;float:right}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:8px 6px;vertical-align:top}tr+tr td{box-shadow:inset 0 1px 0 var(--sep)}thead th{color:var(--mute);font-weight:600}
+.why{max-width:420px}.bad{color:var(--bad)}a{color:var(--link)}code{font-size:12px}
+.wrap{overflow-x:auto}button{background:var(--accent);color:var(--on-accent);border:0;border-radius:22px;min-height:44px;padding:0 18px;font:inherit;font-weight:700;cursor:pointer;float:right}
+.bars{display:grid;gap:6px;background:var(--fill);border-radius:12px;padding:12px}.bar{display:grid;grid-template-columns:110px 1fr 40px;gap:8px;align-items:center}
+.bar i{display:block;height:14px;border-radius:4px;background:var(--blue)}.bar.ok i{background:var(--accent)}
 html[data-lang=id] [data-l=en],html[data-lang=en] [data-l=id]{display:none}
 </style></head><body><main>
 <button onclick="var h=document.documentElement;h.dataset.lang=h.dataset.lang==='en'?'id':'en'">ID / EN</button>
@@ -199,6 +200,11 @@ html[data-lang=id] [data-l=en],html[data-lang=en] [data-l=id]{display:none}
 <p class="mute">${t("Periode", "Period")} ${esc(r.period.from)} – ${esc(r.period.to)} · ${t("dibuat", "generated")} ${esc(r.generated_at.slice(0, 16).replace("T", " "))} UTC · ${t("Rantai ledger", "Ledger chain")}: ${r.ledger_intact ? t("utuh", "intact") : `<b class="bad">${t("rusak", "broken")}</b>`}</p>
 <p>${t("Setiap baris adalah keputusan agen yang tercatat di Meko dan di ledger Reeve. Reeve menghitung ulang hash jejak dari Meko dan membandingkannya dengan receipt; anchor membuktikan receipt tidak diubah sesudahnya.", "Every row is an agent decision recorded in Meko and in the Reeve ledger. Reeve recomputes each trace hash from Meko and compares it with its receipt; the anchor proves the receipt was not changed afterwards.")}</p>
 <div class="tiles">${tiles.map(([a, b, v]) => `<div class="tile">${t(a, b)}<b>${esc(v)}</b></div>`).join("")}</div>
+<h2>${t("Keputusan per agen", "Decisions per agent")}</h2>
+<div class="bars">${Object.entries(r.totals.by_agent)
+    .sort((a, b) => b[1] - a[1])
+    .map(([a, n]) => `<div class="bar"><span>${esc(a)}</span><i style="width:${Math.max(2, Math.round((n / Math.max(1, r.totals.decisions)) * 100))}%"></i><b>${n}</b></div>`)
+    .join("")}<div class="bar ok"><span>${t("terverifikasi", "verified")}</span><i style="width:${Math.round((r.totals.verified / Math.max(1, r.totals.decisions)) * 100)}%"></i><b>${r.totals.verified}</b></div></div>
 <h2>${t("Keputusan", "Decisions")}</h2>
 <div class="wrap"><table><thead><tr><th>${t("Waktu", "Time")}</th><th>${t("Agen", "Agent")}</th><th>${t("Tindakan", "Action")}</th><th>${t("Untuk", "About")}</th><th>${t("Aturan", "Rule")}</th><th>${t("Alasan (dari jejak)", "Reasoning (from trace)")}</th><th>${t("Cek", "Check")}</th><th>Receipt</th></tr></thead><tbody>${rows}</tbody></table></div>
 <h2>Anchor</h2><ul>${anchors}</ul>

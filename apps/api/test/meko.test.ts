@@ -34,7 +34,7 @@ describe("public Meko view", () => {
     expect(res.verify.ok).toBe(true);
     expect(res.trace.reasoning).toContain("Rule R3");
     expect(res.trace.seen).toHaveLength(1);
-    expect(res.chain).toHaveLength(2);
+    expect(res.chain).toHaveLength(1); // only decisions about K05
     expect((await get("/decisions/nope")).status).toBe(404);
   });
 

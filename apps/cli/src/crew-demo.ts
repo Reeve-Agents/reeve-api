@@ -91,7 +91,9 @@ await owner.decide({ input: "approve rulebook kos-melati", output: { approved: t
 say(`SOP audit ${attempt.verdict.status}: ${mut.killed}/${mut.total} planted defects, ${attempt.plan.cases.length} spec cases`);
 
 // 2. An owner exception becomes shared memory; rent ticks apply the cards after checking it.
-await owner.remember("Kamar 3 boleh telat sampai 10 hari untuk tagihan Desember 2026, izin pemilik.", { kind: "owner_exception", room: "3", until: "2026-12-31" }, { promote: true });
+const izin = "Kamar 3 boleh telat sampai 10 hari untuk tagihan Desember 2026, izin pemilik.";
+await owner.remember(izin, { kind: "owner_exception", room: "3", until: "2026-12-31" }, { promote: true });
+await owner.decide({ input: "Penghuni kamar 3 (K03) minta izin telat bayar Desember", output: { exception: izin, shared: true }, reasoning: "The owner granted a one-month exception; it is promoted to shared memory so the Operator, Builder and WhatsApp replies all see it.", action: "grant_exception", action_class: "exception", subject: "K03" });
 const bills: TenantBill[] = [
   { id: "K03", room: "3", due: day, paid: false, tenure_months: 5 },
   { id: "K05", room: "5", due: day, paid: false, tenure_months: 3 },

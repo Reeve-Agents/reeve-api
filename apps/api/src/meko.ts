@@ -52,7 +52,12 @@ export function createMekoApp(deps: MekoAppDeps) {
     if (!check.decision) return c.json({ error: "Receipt ini tidak ada di ledger." }, 404);
     const msgs = new Map<string, MekoMessage[]>();
     const chain = [];
-    for (const d of w.decisions({ run_id: check.decision.run_id })) {
+    // The chain: how the rule got approved (Builder, Auditor, owner, before this decision), then
+    // every decision about the same person. Without a subject (a playbook run), the whole run.
+    const cur = check.decision;
+    const GOV = new Set(["builder", "auditor", "owner"]);
+    const inChain = (d: typeof cur) => !cur.subject || d.subject === cur.subject || (GOV.has(d.agent) && !d.subject && d.seq < cur.seq);
+    for (const d of w.decisions({ run_id: cur.run_id }).filter(inChain)) {
       const key = `${d.agent}:${d.conversation_id}`;
       if (!msgs.has(key)) msgs.set(key, (await w.conversation(d.agent, d.conversation_id)).messages);
       const m = msgs.get(key)!.find((x) => x.metadata?.reeve_receipt === d.entry_hash);
