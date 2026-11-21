@@ -38,6 +38,8 @@ export interface TurnInput {
   plan?: string[];
   action?: string;
   action_class?: string;
+  /** Pseudonymous id of who the decision is about ("K03"). */
+  subject?: string;
   usage?: TokenUsage;
 }
 
@@ -127,11 +129,17 @@ export class MekoWorkspace {
   }
 
   /** Every decision entry in the ledger for this workspace, oldest first. */
-  decisions(filter: { run_id?: string; agent?: string } = {}): (LedgerEntry & DecisionBody)[] {
+  decisions(filter: { run_id?: string; agent?: string; subject?: string; action_class?: string } = {}): (LedgerEntry & DecisionBody)[] {
     return this.ledger
       .entries()
       .filter((e): e is LedgerEntry & DecisionBody => e.kind === "decision" && (e as DecisionBody).workspace === this.workspace)
-      .filter((e) => (!filter.run_id || e.run_id === filter.run_id) && (!filter.agent || e.agent === filter.agent));
+      .filter(
+        (e) =>
+          (!filter.run_id || e.run_id === filter.run_id) &&
+          (!filter.agent || e.agent === filter.agent) &&
+          (!filter.subject || e.subject === filter.subject) &&
+          (!filter.action_class || e.action_class === filter.action_class),
+      );
   }
 
   async conversation(agent: string, conversationId: string): Promise<MekoConversation> {
@@ -285,6 +293,7 @@ export class AgentTrace {
       trace_hash,
       ...(turn.action ? { action: turn.action } : {}),
       ...(turn.action_class ? { action_class: turn.action_class } : {}),
+      ...(turn.subject ? { subject: turn.subject } : {}),
     });
     const metadata: Record<string, unknown> = {
       reeve_receipt: entry.entry_hash,
@@ -294,6 +303,7 @@ export class AgentTrace {
       reeve_lookups: body.lookups,
       ...(turn.action ? { reeve_action: turn.action } : {}),
       ...(turn.action_class ? { reeve_action_class: turn.action_class } : {}),
+      ...(turn.subject ? { reeve_subject: turn.subject } : {}),
       ...(turn.usage ? { reeve_usage: turn.usage } : {}),
     };
     const res = await ws.transport.call("conversation_add_message", { ...this.base(), input, output, reasoning, plan, metadata });

@@ -117,6 +117,8 @@ export interface DecisionBody {
   action?: string;
   /** Action class for the autonomy ladder, e.g. "reminder" or "deposit_bill". */
   action_class?: string;
+  /** Who it is about, pseudonymised ("K03", "P1"), so "kenapa saya didenda?" can find it. */
+  subject?: string;
 }
 
 /**
