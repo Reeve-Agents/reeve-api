@@ -9,6 +9,8 @@ import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
+import { createMekoApp } from "./meko";
+import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
 import { schedulerFromEnv } from "./scheduler";
 import { filePersistence } from "./persistence";
 import { openPostgres } from "./pg";
@@ -45,8 +47,21 @@ const supabase = process.env.SUPABASE_URL && supabaseKey ? { url: process.env.SU
 // REEVE_SCHEDULER=on advances every operation by itself; REEVE_SCHEDULER_DAY_SECONDS=30 shows a business day every 30 seconds.
 const scheduler = schedulerFromEnv();
 
+// Meko demo workspace (pseudonymised Kos Melati traces), public and read-only at /api/meko/public/*.
+// Local Meko by default; Meko Cloud with MEKO_API_KEY. Seed it with `npm run crew:demo`.
+const mekoWorkspace = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
+const mekoEndpoint = mekoEndpointFromEnv();
+const mekoApp = createMekoApp({
+  workspace: mekoWorkspace,
+  ledger: (await persistence.openWorkspace(`meko-${mekoWorkspace}`)).ledger,
+  connect: () => connectMeko(mekoEndpoint),
+  endpoint: mekoEndpoint,
+  allowAsk: process.env.REEVE_MEKO_PUBLIC_ASK === "on",
+});
+
 const { app, openAll } = await createAccountsApp({
   persistence,
+  publicApps: [{ prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) }],
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
   supabase,

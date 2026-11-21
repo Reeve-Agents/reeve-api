@@ -65,7 +65,7 @@ export class FakeMeko implements MekoTransport {
         return { id: c.id, agent_id: agent, run_id: c.run_id ?? null, title: c.title, metadata: c.metadata };
       }
       case "datapack_list":
-        return [...this.packs].filter(([, n]) => !args.query || n.includes(String(args.query))).map(([id, name]) => ({ datapack_id: id, name }));
+        return [...this.packs].filter(([, n]) => !args.query || n.includes(String(args.query))).map(([id, name]) => ({ datapack_id: id, datapack_name: name }));
       case "datapack_create": {
         const id = randomUUID();
         this.packs.set(id, String(args.name));
@@ -103,15 +103,23 @@ export class FakeMeko implements MekoTransport {
       case "memory_search": {
         const q = words(String(args.query));
         const hits = this.mems
-          .filter((m) => m.datapack_id === args.datapack_id && (m.promoted || m.agent_id === args.agent_id))
+          .filter((m) => m.datapack_id === args.datapack_id && (tool === "context_search" ? !m.promoted && m.agent_id === args.agent_id : m.promoted || m.agent_id === args.agent_id))
           .map((m) => ({ m, score: [...words(m.memory)].filter((w) => q.has(w)).length / Math.max(1, q.size) }))
           .filter((h) => h.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, Number(args.limit ?? 5))
           .map(({ m, score }) => ({ id: m.id, memory: m.memory, hash: m.hash, score, metadata: m.metadata }));
         if (tool === "memory_search") return { results: hits };
-        const sent = hits.reduce((n, h) => n + Math.ceil(h.memory.length / 4), 0);
-        return { results: { knowledge_base: [], memory: hits, conversation: { hits: [], thread: [] } }, token_savings: { memory: { tokens_sent: sent, tokens_saved: 10000 - sent }, tokens_saved: 10000 - sent } };
+        // Like real Meko: promoted memories surface as knowledge-base chunks, metadata dropped.
+        const shared = this.mems
+          .filter((m) => m.datapack_id === args.datapack_id && m.promoted)
+          .map((m) => ({ m, score: [...words(m.memory)].filter((w) => q.has(w)).length / Math.max(1, q.size) }))
+          .filter((h) => h.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, Number(args.limit ?? 5))
+          .map(({ m, score }) => ({ id: randomUUID(), chunk_text: m.memory, metadata_filters: { agent_id: m.agent_id, memory_id: m.id, source: "memory" }, rerank_score: score }));
+        const sent = [...hits.map((h) => h.memory), ...shared.map((h) => h.chunk_text)].reduce((n, t) => n + Math.ceil(t.length / 4), 0);
+        return { results: { knowledge_base: shared, memory: hits, conversation: { hits: [], thread: [] } }, token_savings: { memory: { tokens_sent: sent, tokens_saved: 10000 - sent }, tokens_saved: 10000 - sent } };
       }
       case "artifact_put": {
         const content = Buffer.from(String(args.content_base64), "base64").toString("utf8");

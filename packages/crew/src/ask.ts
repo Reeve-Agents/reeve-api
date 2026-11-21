@@ -28,7 +28,7 @@ export function askKind(q: string): AskAnswer["kind"] {
 export class AskBusiness {
   constructor(
     readonly ws: MekoWorkspace,
-    readonly proofUrl: (receipt: string) => string = (r) => `/?view=explain&receipt=${r}`,
+    readonly proofUrl: (receipt: string) => string = (r) => `/?view=jejak&receipt=${r}`,
   ) {}
 
   private async message(d: LedgerEntry & DecisionBody): Promise<MekoMessage | undefined> {

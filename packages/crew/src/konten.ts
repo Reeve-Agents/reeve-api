@@ -102,10 +102,13 @@ export class KontenLoop extends Crew {
     const stats = new Map<Hook, { n: number; chats: number }>();
     const counted = new Set<string>(); // a promoted memory is a copy of the private one
     for (const m of seen.memory) {
-      const hook = m.metadata?.hook as Hook | undefined;
-      const chats = Number(m.metadata?.wa_inquiries);
-      const piece = String(m.metadata?.piece ?? m.id);
-      if (m.kind !== "content_result" || !hook || !Number.isFinite(chats) || counted.has(piece)) continue;
+      // Read from the text: shared memories lose their metadata in Meko.
+      const r = m.text.match(/Konten (ct_[\w]+) hook "(\w+)".*?menghasilkan (\d+) chat/);
+      if (!r) continue;
+      const [, piece, hookText, chatsText] = r as unknown as [string, string, string, string];
+      const hook = hookText as Hook;
+      const chats = Number(chatsText);
+      if (!HOOKS.includes(hook) || counted.has(piece)) continue;
       counted.add(piece);
       const s = stats.get(hook) ?? { n: 0, chats: 0 };
       stats.set(hook, { n: s.n + 1, chats: s.chats + chats });
@@ -177,7 +180,7 @@ export class KontenLoop extends Crew {
       action_class: "measure",
     });
     await op.remember(
-      `Konten hook "${piece.plan.hook}" untuk kamar ${piece.plan.room} (${piece.plan.date}, momen ${piece.plan.moments.join("/") || "-"}) menghasilkan ${piece.metrics.wa_inquiries} chat calon penghuni dari ${piece.metrics.views} views.`,
+      `Konten ${piece.id} hook "${piece.plan.hook}" untuk kamar ${piece.plan.room} (${piece.plan.date}, momen ${piece.plan.moments.join("/") || "-"}) menghasilkan ${piece.metrics.wa_inquiries} chat calon penghuni dari ${piece.metrics.views} views.`,
       { kind: "content_result", hook: piece.plan.hook, wa_inquiries: piece.metrics.wa_inquiries, views: piece.metrics.views, piece: piece.id },
       { promote: true },
     );

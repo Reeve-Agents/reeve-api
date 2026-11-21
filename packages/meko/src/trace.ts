@@ -113,10 +113,17 @@ export class MekoWorkspace {
   static async open(transport: MekoTransport, opts: WorkspaceOptions): Promise<MekoWorkspace> {
     const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}` }), "conversation_id", "id");
     const name = MekoWorkspace.datapackName(opts.workspace);
-    const listed = await transport.call("datapack_list", { conversation_id: setup, query: name });
-    const packs = (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
-    const hit = packs.find((p) => p.name === name);
-    const datapackId = hit ? str(hit, "datapack_id", "id") : str(await transport.call("datapack_create", { conversation_id: setup, name }), "datapack_id", "id");
+    const find = async () => {
+      const listed = await transport.call("datapack_list", { conversation_id: setup, limit: 200 });
+      const packs = (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
+      return packs.find((p) => (p.datapack_name ?? p.name) === name);
+    };
+    let hit = await find();
+    if (!hit) {
+      const created = (await transport.call("datapack_create", { conversation_id: setup, name })) as Record<string, unknown>;
+      hit = created.error === "CONFLICT" ? await find() : created;
+    }
+    const datapackId = str(hit, "datapack_id", "id");
     return new MekoWorkspace(transport, opts.workspace, opts.ledger, datapackId, setup, opts);
   }
 
@@ -225,17 +232,26 @@ export class AgentTrace {
       results?: { memory?: Record<string, unknown>[]; knowledge_base?: Record<string, unknown>[] };
       token_savings?: { tokens_saved?: number; memory?: { tokens_sent?: number } };
     };
+    // Promoted (collective) memories come back as knowledge-base chunks with source "memory" and
+    // without their metadata, so callers must read facts from the text, not from metadata.
+    const kb = res.results?.knowledge_base ?? [];
+    const filters = (k: Record<string, unknown>) => (k.metadata_filters ?? {}) as Record<string, unknown>;
     const lookup: Lookup = {
       query: this.clean(query),
-      memory: (res.results?.memory ?? []).map((m) => ({
-        id: String(m.id),
-        text: String(m.memory ?? ""),
-        hash: m.hash as string | undefined,
-        score: m.score as number | undefined,
-        kind: (m.metadata as Record<string, unknown> | undefined)?.kind as string | undefined,
-        metadata: m.metadata as Record<string, unknown> | undefined,
-      })),
-      knowledge: (res.results?.knowledge_base ?? []).map((k) => ({ id: String(k.id ?? k.chunk_id ?? ""), text: String(k.text ?? k.content ?? "") })),
+      memory: [
+        ...(res.results?.memory ?? []).map((m) => ({
+          id: String(m.id),
+          text: String(m.memory ?? ""),
+          hash: m.hash as string | undefined,
+          score: m.score as number | undefined,
+          kind: (m.metadata as Record<string, unknown> | undefined)?.kind as string | undefined,
+          metadata: m.metadata as Record<string, unknown> | undefined,
+        })),
+        ...kb
+          .filter((k) => filters(k).source === "memory")
+          .map((k) => ({ id: String(filters(k).memory_id ?? k.id), text: String(k.chunk_text ?? ""), score: k.rerank_score as number | undefined, kind: "shared", metadata: { shared: true, agent_id: filters(k).agent_id } })),
+      ],
+      knowledge: kb.filter((k) => filters(k).source !== "memory").map((k) => ({ id: String(k.id ?? k.chunk_id ?? ""), text: String(k.chunk_text ?? k.text ?? k.content ?? "") })),
       tokens_saved: res.token_savings?.tokens_saved,
       tokens_sent: res.token_savings?.memory?.tokens_sent,
     };
@@ -301,6 +317,9 @@ export class AgentTrace {
       reeve_run: this.run.runId,
       reeve_trace_hash: trace_hash,
       reeve_lookups: body.lookups,
+      // Not hashed: what the agent saw, for the "explain this decision" page (ids above are hashed).
+      reeve_seen: lookups.map((l) => ({ query: l.query, memory: l.memory.map((m) => ({ id: m.id, text: m.text.slice(0, 240), kind: m.kind })) })),
+      reeve_tokens_saved: lookups.reduce((n, l) => n + (l.tokens_saved ?? 0), 0),
       ...(turn.action ? { reeve_action: turn.action } : {}),
       ...(turn.action_class ? { reeve_action_class: turn.action_class } : {}),
       ...(turn.subject ? { reeve_subject: turn.subject } : {}),

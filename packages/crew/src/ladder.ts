@@ -3,6 +3,7 @@
 // complaint). Any override, complaint or undo moves it down at once. Every change is a traced turn.
 import type { AgentTrace, MekoWorkspace } from "@reeve/meko";
 import type { PasskeyProof } from "./crew";
+import type { Playbook } from "./playbook";
 
 export const LEVELS = ["ask", "ask_if_unusual", "auto_digest", "auto"] as const;
 export type Level = (typeof LEVELS)[number];
@@ -56,6 +57,20 @@ export class Ladder {
     if (l === "ask_if_unusual") return "auto";
     return l === "auto_digest" ? "auto_digest" : "auto";
   };
+
+  /**
+   * Approving a playbook whose step says "auto_if_whitelisted_intent" or "auto_within_bound" is the
+   * owner's consent for that class to run on the usual cases: it starts at ask_if_unusual, not ask.
+   */
+  grantFromPlaybook(pb: Playbook, approvalSeq: number): string[] {
+    const granted: string[] = [];
+    for (const s of pb.steps)
+      if ((s.review === "auto_if_whitelisted_intent" || s.review === "auto_within_bound") && this.level(s.action_class) === "ask") {
+        this.state.levels[s.action_class] = { level: "ask_if_unusual", since_seq: approvalSeq };
+        granted.push(s.action_class);
+      }
+    return granted;
+  }
 
   /** Clean receipts of this class since its level last changed, read from the ledger. */
   evidence(cls: string): { clean: number; bad: number; receipts: string[] } {

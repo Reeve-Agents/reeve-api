@@ -23,6 +23,7 @@
     "connectors:send": "tsx --env-file=.env apps/cli/src/connectors-send.ts",
     "connectors:read": "tsx --env-file=.env apps/cli/src/connectors-read.ts",
     "preview:seed": "rm -rf .reeve/preview && tsx apps/api/scripts/seed-preview.ts",
+    "crew:demo": "tsx --env-file-if-exists=.env apps/cli/src/crew-demo.ts",
     "demo:minimarket": "tsx apps/cli/src/main.ts demo --pack=minimarket --llm=fixture",
     "demo:generic": "tsx apps/cli/src/main.ts demo --pack=bimbel-cerdas --llm=fixture",
     "demo:minimarket:createos": "tsx --env-file=.env apps/cli/src/main.ts demo --pack=minimarket --llm=fixture --sandbox=createos",
