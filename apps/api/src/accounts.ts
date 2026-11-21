@@ -52,6 +52,8 @@ export interface AccountDeps {
   sessionSecret?: string;
   /** Supabase Auth for the magic-link backup (project URL and a secret or service-role key). */
   supabase?: { url: string; key: string } | null;
+  /** Read-only public apps served without a session, by path prefix (the Meko demo workspace). */
+  publicApps?: { prefix: string; fetch: (req: Request) => Response | Promise<Response> }[];
 }
 
 const COOKIE = "reeve_session";
@@ -267,6 +269,21 @@ export async function createAccountsApp(deps: AccountDeps) {
 
   // ── Everything else belongs to the signed-in account's workspace ──
   app.all("/*", async (c) => {
+    // Webhooks (rails, Telegram) come from outside with no session: each proves itself by its own signature or secret.
+    // The bill or chat belongs to one workspace, so offer it to each until one takes it.
+    if (c.req.path.startsWith("/api/webhooks/")) {
+      const raw = await c.req.text();
+      let last: Response | null = null;
+      for (const a of Object.values(index.accounts)) {
+        const res = await (await workspace(a)).fetch(new Request(c.req.url, { method: c.req.method, headers: c.req.raw.headers, body: c.req.method === "GET" ? undefined : raw }));
+        const body = (await res.clone().json().catch(() => ({}))) as { ignored?: boolean };
+        if (!(res.ok && body.ignored)) return res;
+        last = res;
+      }
+      return last ?? c.json({ ignored: true });
+    }
+    const pub = deps.publicApps?.find((p) => c.req.path.startsWith(p.prefix));
+    if (pub) return pub.fetch(c.req.raw);
     const account = sessionAccount(c);
     if (!account) {
       if (c.req.path === "/api/health") return c.json({ ...deps.publicHealth(), signedIn: false });
@@ -275,5 +292,8 @@ export async function createAccountsApp(deps: AccountDeps) {
     return (await workspace(account)).fetch(c.req.raw);
   });
 
-  return { app, accounts: () => Object.values(index.accounts) };
+  /** Opens every account's workspace now (the scheduler lives inside each workspace's app, so it must be running before anyone signs in). */
+  const openAll = () => Promise.all(Object.values(index.accounts).map((a) => workspace(a)));
+
+  return { app, accounts: () => Object.values(index.accounts), openAll };
 }

@@ -98,7 +98,28 @@ export type LedgerEntry =
   | { kind: "receipt"; seq: number; at: string; receipt_hash: string; run_id: string; verdict: string; prev: string; entry_hash: string }
   | ({ kind: "anchor"; seq: number; prev: string; entry_hash: string } & AnchorBody)
   | { kind: "approval"; seq: number; at: string; rulebook_id: string; receipt_hash: string; credential_id: string; prev: string; entry_hash: string }
-  | ({ kind: "operation"; seq: number; prev: string; entry_hash: string } & OperationBody);
+  | ({ kind: "operation"; seq: number; prev: string; entry_hash: string } & OperationBody)
+  | ({ kind: "decision"; seq: number; prev: string; entry_hash: string } & DecisionBody);
+
+/**
+ * One agent turn traced in Meko. `trace_hash` commits to what Meko stores for that turn (input,
+ * output, reasoning, plan, lookups), so an edit on either side shows up when the two are compared.
+ * The entry's own `entry_hash` is the receipt hash written back into the Meko message metadata.
+ */
+export interface DecisionBody {
+  at: string;
+  workspace: string;
+  run_id: string;
+  agent: string;
+  conversation_id: string;
+  trace_hash: string;
+  /** What was decided, in one word ("hold", "charge_fee", "approve", "publish", ...). */
+  action?: string;
+  /** Action class for the autonomy ladder, e.g. "reminder" or "deposit_bill". */
+  action_class?: string;
+  /** Who it is about, pseudonymised ("K03", "P1"), so "kenapa saya didenda?" can find it. */
+  subject?: string;
+}
 
 /**
  * A Merkle root over the receipts so far. `anchor` is where it was published: "local-ledger" (this
@@ -120,10 +141,27 @@ export interface OperationBody {
   at: string;
   operation_id: string;
   rail: string;
-  event: "invoice_created" | "payment_received" | "message_logged" | "exception_raised" | "refund_issued" | "credit_kept" | "blocked" | "rules_upgraded";
+  event:
+    | "invoice_created"
+    | "payment_received"
+    | "message_logged"
+    | "message_sent"
+    /** A message the owner sends from their own WhatsApp: Reeve only made the link (channel "whatsapp_link"), nothing was sent. */
+    | "message_prepared"
+    /** The owner says they sent a prepared message. Reeve cannot see WhatsApp: this is the owner's word. */
+    | "message_sent_by_owner"
+    | "reply_received"
+    | "reply_actioned"
+    | "exception_raised"
+    | "refund_issued"
+    | "credit_kept"
+    | "blocked"
+    | "rules_upgraded";
   tenant?: string;
   amount?: number;
   ref?: string;
+  /** For message events: how the message travels (e.g. "whatsapp_link"). */
+  channel?: string;
   receipt_hash: string;
 }
 
@@ -131,7 +169,8 @@ export type LedgerBody =
   | { kind: "receipt"; at: string; receipt_hash: string; run_id: string; verdict: string }
   | ({ kind: "anchor" } & AnchorBody)
   | { kind: "approval"; at: string; rulebook_id: string; receipt_hash: string; credential_id: string }
-  | ({ kind: "operation" } & OperationBody);
+  | ({ kind: "operation" } & OperationBody)
+  | ({ kind: "decision" } & DecisionBody);
 
 /**
  * Append-only, hash-chained local ledger (the track record).
@@ -158,6 +197,14 @@ function fileBackend(path: string): LedgerBackend {
       appendFileSync(path, JSON.stringify(entry) + "\n");
     },
   };
+}
+
+/**
+ * The leaves an anchor commits to: audited run receipts and, since the Meko crew, traced agent
+ * decisions (by entry hash). Ledgers from before decisions existed give the same leaves as before.
+ */
+export function anchorLeaves(entries: LedgerEntry[]): string[] {
+  return entries.flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : e.kind === "decision" ? [e.entry_hash] : []));
 }
 
 export class Ledger {

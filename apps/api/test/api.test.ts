@@ -14,7 +14,7 @@ import { Store } from "../src/store";
 
 const fixtures = Object.values(PACK_FIXTURE).map((f) => loadFixtureRulebook(f));
 
-function setup(providers = ProviderRegistry.of([new FixtureProvider(fixtures)]), anchor: AppDeps["anchor"] = null) {
+function setup(providers = ProviderRegistry.of([new FixtureProvider(fixtures)]), anchor: AppDeps["anchor"] = null, extra: Partial<AppDeps> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "reeve-api-"));
   const store = new Store(null);
   const ledger = new Ledger(join(dir, "ledger.jsonl"));
@@ -34,9 +34,10 @@ function setup(providers = ProviderRegistry.of([new FixtureProvider(fixtures)]),
     },
     rp: { id: "localhost", name: "Reeve", origin: "http://localhost:5173" },
     anchor,
+    ...extra,
   });
-  const call = async (method: string, path: string, body?: unknown) => {
-    const res = await app.request(`/api${path}`, { method, headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const call = async (method: string, path: string, body?: unknown, headers: Record<string, string> = {}) => {
+    const res = await app.request(`/api${path}`, { method, headers: { "content-type": "application/json", ...headers }, body: body === undefined ? undefined : JSON.stringify(body) });
     return { status: res.status, json: (await res.json()) as any };
   };
   return { app, store, ledger, call };
@@ -140,6 +141,49 @@ describe("api", () => {
     expect(JSON.stringify(res.json)).not.toContain("secret");
     // A parser that is not set up is refused before any call goes out.
     expect((await call("POST", "/sops", { text: loadFixtureSop(), provider: "groq" })).status).toBe(400);
+  });
+
+  it("reads a tenant's Telegram reply: needs the secret, matches the chat id, uses the LLM only when switched on, and without it hands everything to the owner", async () => {
+    const asked: string[] = [];
+    const llm = Object.assign(new FixtureProvider(fixtures), {
+      completeText: async (system: string) => {
+        asked.push(system.includes("label its intent") ? "classify" : "draft");
+        return system.includes("label its intent") ? '```json\n{"intent":"asks_relief","promised_date":null}\n```' : "Halo, mohon bayar.";
+      },
+    });
+    const reply = async (extra: Partial<AppDeps>, secretHeader?: string) => {
+      const { call, store } = setup(ProviderRegistry.of([llm]), null, extra);
+      const rb = await call("POST", "/sops", { text: loadFixtureSop() });
+      const run = await waitForRun(call, (await call("POST", `/rulebooks/${rb.json.id}/runs`, {})).json.id);
+      Object.assign(store.data.rulebooks[rb.json.id]!, { status: "approved", approval: { at: "", credentialId: "cred1", receiptHash: run.receipt.receipt_hash, ledgerSeq: 0 } });
+      store.data.passkeys.push({ id: "cred1", publicKey: "x", counter: 0, createdAt: "" });
+      const op = (await call("POST", `/rulebooks/${rb.json.id}/operations`, { rail: "mock" })).json;
+      (store.data.operations[op.id] as { contacts?: unknown }).contacts = { K29: { telegram_chat_id: "9001" } };
+      const hook = (chat: number | string) => call("POST", "/webhooks/telegram", { message: { chat: { id: chat }, text: "boleh dicicil kak?" } }, secretHeader ? { "x-telegram-bot-api-secret-token": secretHeader } : {});
+      return { call, op, hook };
+    };
+
+    // No secret configured: the webhook is off. Wrong or missing secret: refused.
+    expect((await (await reply({})).hook(9001)).status).toBe(409);
+    expect((await (await reply({ telegramWebhookSecret: "s3cret" }, "nope")).hook(9001)).status).toBe(401);
+    expect((await (await reply({ telegramWebhookSecret: "s3cret" })).hook(9001)).status).toBe(401);
+
+    // Right secret, LLM not switched on: the reply is recorded and goes to the owner; no model is called.
+    const off = await reply({ telegramWebhookSecret: "s3cret" }, "s3cret");
+    expect(await off.hook(1234)).toMatchObject({ status: 200, json: { ignored: true } }); // unknown chat
+    expect((await off.hook(9001)).json).toMatchObject({ ok: true, action: "hand_to_owner", status: "waiting_owner" });
+    expect(asked).toEqual([]);
+
+    // LLM switched on: the model reads the reply, and only classifies.
+    const on = await reply({ telegramWebhookSecret: "s3cret", operatorLlm: true }, "s3cret");
+    expect((await on.hook("9001")).json).toMatchObject({ ok: true, action: "hand_to_owner", status: "waiting_owner" });
+    expect(asked).toEqual(["classify"]);
+    const direct = await on.call("POST", `/operations/${on.op.id}/replies`, { tenant: "K29", text: "boleh dicicil kak?" });
+    expect(direct.status).toBe(201);
+    expect(direct.json).toMatchObject({ intent: "asks_relief", source: "llm" });
+    const resolved = await on.call("POST", `/operations/${on.op.id}/replies/${direct.json.id}/resolve`);
+    expect(resolved.json.status).toBe("resolved");
+    expect((await on.call("POST", `/operations/${on.op.id}/replies`, { tenant: "K29" })).status).toBe(400);
   });
 
   it("runs the approved rulebook on a rail: bills, payments, a double payment, a passkey-gated refund", async () => {
@@ -393,6 +437,40 @@ describe("api", () => {
     // Without Composio the apps can be browsed but not connected.
     const { call } = setup();
     expect((await call("POST", "/apps/notion/connect")).status).toBe(409);
+  });
+
+  it("runs minimarket purchase orders through the generic Operator: supplier message via the connector, big orders held", async () => {
+    const { call, store, ledger } = setup();
+    const sop = await call("GET", "/fixtures/sop?pack=minimarket");
+    const rb = await call("POST", "/sops", { text: sop.json.sop, pack: "minimarket" });
+    const run = await waitForRun(call, (await call("POST", `/rulebooks/${rb.json.id}/runs`, {})).json.id);
+    expect((await call("POST", `/rulebooks/${rb.json.id}/operations`, {})).status).toBe(409); // not approved yet
+    Object.assign(store.data.rulebooks[rb.json.id]!, { status: "approved", approval: { at: "", credentialId: "cred1", receiptHash: run.receipt.receipt_hash, ledgerSeq: 0 } });
+    store.data.passkeys.push({ id: "cred1", publicKey: "x", counter: 0, createdAt: "" });
+
+    // Supplier A has a Telegram chat; with no real connector the registry answers "no connected service", and the order falls back to the log.
+    const op = await call("POST", `/rulebooks/${rb.json.id}/operations`, { suppliers: { A: { telegram_chat_id: 777 }, B: { email: "  " } } });
+    expect(op.status).toBe(201);
+    expect(op.json.kind).toBe("generic");
+    expect(op.json.suppliers).toEqual({ A: { telegram_chat_id: "777" } });
+    expect(op.json.startDate).toBe(minimarketScenario().start_date);
+    expect((await call("POST", `/operations/${op.json.id}/advance`, { to: "2026-11-03" })).status).toBe(202);
+    let state: any;
+    for (let i = 0; i < 200; i++) {
+      state = (await call("GET", `/operations/${op.json.id}`)).json;
+      if (state.status !== "running") break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    expect(state.status).toBe("idle");
+    expect(state.sent.length).toBeGreaterThan(0);
+    // Only allow-listed message tools; the order text names the supplier and the item.
+    for (const s of state.sent) expect(["TELEGRAM_SEND_MESSAGE", "GMAIL_SEND_EMAIL", "LOG"]).toContain(s.tool);
+    expect(state.sent[0].args.text ?? state.sent[0].args.body).toContain("Supplier A");
+    // The big order waits for the owner's passkey, and nothing has gone out for it.
+    const held = state.held.find((h: { kind: string }) => h.kind === "approval_request");
+    expect(held).toMatchObject({ key: "S09", amount: 3_038_000, needsPasskey: true, status: "open" });
+    expect(state.sent.some((s: { key: string }) => s.key === "S09")).toBe(false);
+    expect(ledger.entries().some((e) => e.kind === "operation" && e.event === "exception_raised")).toBe(true);
   });
 
   it("returns WebAuthn registration options for the owner", async () => {

@@ -1,5 +1,5 @@
 import { packOf, Rulebook, validateRulebook, type PackId, type RulebookIssue } from "@reeve/core";
-import type { LLMProvider, SopHints } from "@reeve/llm";
+import type { LLMProvider, SopHints, UsageListener } from "@reeve/llm";
 import { canonicalJson, sha256 } from "@reeve/receipts";
 import { generateBuilderTestsPy, generateRulesPy, modelFromRulebook, type InjectedBug as RentBug } from "./codegen";
 import { generateGenericBuilderTestsPy, generateGenericRulesPy, type GenericBug } from "./codegen-generic";
@@ -19,8 +19,8 @@ export interface ParsedSop {
 }
 
 /** Phase 1: plain-language SOP → structured rule cards (+ clarifying questions) for one domain pack. */
-export async function parseSop(provider: LLMProvider, sop: string, pack: PackId = "rent-collection", hints?: SopHints): Promise<ParsedSop> {
-  const rulebook = Rulebook.parse(await provider.parseSop(sop, pack, hints));
+export async function parseSop(provider: LLMProvider, sop: string, pack: PackId = "rent-collection", hints?: SopHints, opts?: { onUsage?: UsageListener }): Promise<ParsedSop> {
+  const rulebook = Rulebook.parse(await provider.parseSop(sop, pack, hints, opts));
   return { rulebook, issues: validateRulebook(rulebook), provider: provider.name };
 }
 

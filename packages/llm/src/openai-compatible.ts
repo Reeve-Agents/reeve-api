@@ -1,5 +1,5 @@
 import type { PackId, Rulebook } from "@reeve/core";
-import { LLMRefusalError, type LLMProvider, type SopHints } from "./provider";
+import { LLMRefusalError, type LLMProvider, type LLMUsage, type SopHints, type UsageListener } from "./provider";
 import { jsonSchemaFor, LLMOutputError, packSchema, rulebookFromJson } from "./schemas";
 
 /**
@@ -33,6 +33,7 @@ interface ChatMessage {
 
 interface ChatResponse {
   choices?: { finish_reason?: string; message?: { content?: string | null; refusal?: string | null } }[];
+  usage?: { prompt_tokens?: number | null; completion_tokens?: number | null };
   error?: { message?: string };
 }
 
@@ -70,7 +71,13 @@ export class OpenAICompatibleProvider implements LLMProvider {
     this.fetch = opts.fetch ?? globalThis.fetch;
   }
 
-  async parseSop(sop: string, pack: PackId = "rent-collection", hints?: SopHints): Promise<Rulebook> {
+  /** `usage` of an OpenAI-style reply: prompt and completion tokens (these services report no cache split). */
+  private usageOf(body: ChatResponse): LLMUsage {
+    return { provider: this.name, model: this.opts.model, inputTokens: body.usage?.prompt_tokens ?? 0, outputTokens: body.usage?.completion_tokens ?? 0, cacheWriteTokens: 0, cacheReadTokens: 0 };
+  }
+
+  async parseSop(sop: string, pack: PackId = "rent-collection", hints?: SopHints, opts?: { onUsage?: UsageListener }): Promise<Rulebook> {
+    const onUsage = opts?.onUsage;
     const messages = (): ChatMessage[] => [
       { role: "system", content: this.system(pack, hints) },
       { role: "user", content: `SOP:\n\n${sop}` },
@@ -78,12 +85,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
     let history = messages();
     let reply: string;
     try {
-      reply = await this.complete(history, pack);
+      reply = await this.complete(history, pack, onUsage);
     } catch (err) {
       if (!(err instanceof HttpError) || err.status !== 400 || this.mode !== "schema") throw err;
       this.mode = "object"; // this server does not take json_schema; remember for later calls
       history = messages();
-      reply = await this.complete(history, pack);
+      reply = await this.complete(history, pack, onUsage);
     }
 
     try {
@@ -95,8 +102,24 @@ export class OpenAICompatibleProvider implements LLMProvider {
         { role: "assistant", content: reply },
         { role: "user", content: `That JSON does not fit the schema: ${err.message}. Reply with the corrected JSON object only.` },
       ];
-      return rulebookFromJson(pack, extractJson(await this.complete(history, pack)));
+      return rulebookFromJson(pack, extractJson(await this.complete(history, pack, onUsage)));
     }
+  }
+
+  async completeText(system: string, user: string, opts?: { maxTokens?: number; onUsage?: UsageListener }): Promise<string> {
+    const res = await this.fetch(`${this.opts.baseURL.replace(/\/+$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(this.opts.apiKey ? { authorization: `Bearer ${this.opts.apiKey}` } : {}), ...this.opts.headers },
+      body: JSON.stringify({ model: this.opts.model, messages: [{ role: "system", content: system }, { role: "user", content: user }], max_tokens: opts?.maxTokens ?? 600 }),
+      signal: AbortSignal.timeout(this.opts.timeoutMs ?? 60_000),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${this.opts.id} returned HTTP ${res.status}: ${text.slice(0, 200)}`);
+    const body = JSON.parse(text) as ChatResponse;
+    opts?.onUsage?.(this.usageOf(body));
+    const content = body.choices?.[0]?.message?.content;
+    if (!content) throw new Error(`${this.name} returned no content`);
+    return content.trim();
   }
 
   private system(pack: PackId, hints?: SopHints): string {
@@ -105,7 +128,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     return `${system}\n\nReply with one JSON object and nothing else. It must match this JSON Schema:\n${JSON.stringify(jsonSchemaFor(pack))}`;
   }
 
-  private async complete(messages: ChatMessage[], pack: PackId): Promise<string> {
+  private async complete(messages: ChatMessage[], pack: PackId, onUsage?: UsageListener): Promise<string> {
     const response_format =
       this.mode === "schema"
         ? { type: "json_schema", json_schema: { name: "rulebook", strict: true, schema: jsonSchemaFor(pack) } }
@@ -128,6 +151,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     } catch {
       throw new Error(`${this.opts.id} returned a non-JSON response`);
     }
+    onUsage?.(this.usageOf(body));
     const choice = body.choices?.[0];
     if (choice?.message?.refusal) throw new LLMRefusalError(`model declined to parse the SOP (${choice.message.refusal})`);
     if (choice?.finish_reason === "length") throw new LLMOutputError(`${this.name} ran out of output tokens before finishing the rule cards`);

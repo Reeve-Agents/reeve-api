@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { classifierFor, completerOf, drafterFor } from "./operator-llm";
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -8,17 +9,19 @@ import {
 import { Hono } from "hono";
 import { parseSop } from "@reeve/builder";
 import { prepareAudit } from "@reeve/auditor";
-import { GenericOperator, NeedsPasskeyError, newGenericOperation, newOperation, Operator, OperatorError, type GenericOperationRecord, type OperationRecord } from "@reeve/broker";
+import { contactsFromRecords, markPreparedSent, minimarketPack, type SupplierContacts, withPayments, GenericOperator, NeedsPasskeyError, newGenericOperation, newOperation, Operator, OperatorError, type GenericOperation, type GenericOperationRecord, type OperationRecord, type RentOperationRecord } from "@reeve/broker";
 import { AppCatalog, inferFields, parseCsv, type ConnectorRegistry } from "@reeve/connectors";
-import { compareRuns, diffRulebooks, packOf, PackId, Rulebook, validateRulebook, type AnyScenario, type Tenant } from "@reeve/core";
+import { compareRuns, diffRulebooks, packOf, PackId, Rulebook, validateRulebook, type AnyScenario, type StockScenario, type Tenant } from "@reeve/core";
 import { PACKS } from "@reeve/core/packs";
-import { CardConversionError, LLMOutputError, LLMRefusalError, UnknownProviderError, type ProviderRegistry } from "@reeve/llm";
+import { CardConversionError, costUsd, fxRate, LLMOutputError, LLMRefusalError, UnknownProviderError, type LLMUsage, type ProviderRegistry, type UsagePhase } from "@reeve/llm";
 import { genericScenario, rentScenario, repoRoot, runAttempt, runOperate, tenantsFromRecords } from "@reeve/pipeline";
-import { RailConfigError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
+import { RailConfigError, SubAccountRequiredError, WebhookVerificationError, type PaymentRail, type RailEntry } from "@reeve/rails";
 import type { ChainAnchor } from "@reeve/anchor";
-import { type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
+import { anchorLeaves, type Ledger, merkleRoot, sha256 } from "@reeve/receipts";
 import type { Sandbox } from "@reeve/sandbox";
-import { newId, type DatasetRecord, type RulebookRecord, type RunRecord, type Store } from "./store";
+import { dueTarget, memoOf, schedulerView, type Scheduled, type SchedulerConfig } from "./scheduler";
+import { newId, type DatasetRecord, type RulebookRecord, type RunRecord, type Store, type UsageRecord } from "./store";
+import { summarize } from "./usage";
 
 export interface AppDeps {
   store: Store;
@@ -44,6 +47,18 @@ export interface AppDeps {
   anchor?: Pick<ChainAnchor, "chainName" | "chain" | "address" | "anchor" | "verify"> | null;
   /** Called when the owner adds a passkey here, so the account layer can sign them in with it too. */
   onPasskeyAdded?: (credentialId: string) => void;
+  /** The business clock: advances every running operation on its own. Off unless enabled (REEVE_SCHEDULER=on). */
+  scheduler?: SchedulerConfig;
+  /** Lets the default LLM word outgoing messages and read tenants' replies (REEVE_OPERATOR_LLM=on). Sends tenant names and amounts to that provider. */
+  operatorLlm?: boolean;
+  /** Provider id for that wording and reading (REEVE_OPERATOR_MODEL). Default anthropic:claude-haiku-5-5; the default Opus/Sonnet is never used for it. */
+  operatorModel?: string;
+  /** Secret Telegram sends in x-telegram-bot-api-secret-token on webhook calls (TELEGRAM_WEBHOOK_SECRET). Unset: the Telegram webhook is off. */
+  telegramWebhookSecret?: string;
+  /** This workspace's id, written on every cost-meter record. */
+  account?: string;
+  /** Where REEVE_USD_IDR and REEVE_PRICE_OVERRIDES are read from (default process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 const CHALLENGE_TTL_MS = 5 * 60_000;
@@ -51,15 +66,62 @@ const CHALLENGE_TTL_MS = 5 * 60_000;
 /** The deliberate Builder defect for "inject a bug", one per pack. */
 const INJECTED_BUG = { "rent-collection": "ignore_tenure_grace", minimarket: "ignore_markdown_floor", generic: "ignore_never_rules" } as const;
 
-export function createApp(deps: AppDeps) {
+export function createApp(rawDeps: AppDeps) {
+  // Payment tools (XENDIT_CREATE_INVOICE, STRIPE_CREATE_INVOICE, MOCK_CREATE_INVOICE) join the connector registry, on the same rails the rent pack bills on.
+  const deps: AppDeps = { ...rawDeps, connectors: withPayments(rawDeps.connectors, rawDeps.rails, (id) => railFor(id)) };
   const { store, ledger } = deps;
   const app = new Hono().basePath("/api");
+
+  // ── Cost meter: every model call's tokens, from the provider's own usage block, tagged with where it happened. ──
+  const env = deps.env ?? process.env;
+  const recordUsage = (phase: UsagePhase, u: LLMUsage, tags: { rulebookId?: string; operationId?: string } = {}): UsageRecord => {
+    const rec: UsageRecord = {
+      id: newId("use"),
+      at: new Date().toISOString(),
+      phase,
+      provider: u.provider,
+      model: u.model,
+      inputTokens: u.inputTokens,
+      outputTokens: u.outputTokens,
+      cacheWriteTokens: u.cacheWriteTokens,
+      cacheReadTokens: u.cacheReadTokens,
+      usd: costUsd(u, env),
+      ...(tags.rulebookId ? { rulebookId: tags.rulebookId } : {}),
+      ...(tags.operationId ? { operationId: tags.operationId } : {}),
+      ...(deps.account ? { account: deps.account } : {}),
+    };
+    (store.data.usage ??= []).push(rec);
+    store.save();
+    return rec;
+  };
+  /**
+   * A Builder call's usage is written the moment the reply is in (so tokens spent on a refused or unusable reply
+   * are counted too); the rulebook it produced does not have an id yet, so `tag` adds it afterwards.
+   */
+  const builderMeter = () => {
+    const mine: UsageRecord[] = [];
+    return {
+      onUsage: (u: LLMUsage) => void mine.push(recordUsage("builder_compile", u)),
+      tag: (rulebookId: string) => {
+        for (const r of mine) r.rulebookId = rulebookId;
+        if (mine.length) store.save();
+      },
+    };
+  };
 
   // One sandbox job at a time (CreateOS Free plan: 1 concurrent sandbox).
   let queue: Promise<void> = Promise.resolve();
   const enqueue = (job: () => Promise<void>) => {
     queue = queue.then(job).catch(() => undefined);
     return queue;
+  };
+
+  // The sandbox runs one job at a time, but nothing else (messages, models, rails) waits on it.
+  let sandboxGate: Promise<unknown> = Promise.resolve();
+  const sandboxed = <T>(job: () => Promise<T>): Promise<T> => {
+    const result = sandboxGate.then(job, job);
+    sandboxGate = result.catch(() => undefined);
+    return result;
   };
 
   app.onError((err, c) => {
@@ -223,7 +285,9 @@ export function createApp(deps: AppDeps) {
       if (problems.length) return c.json({ error: `these rows are not tenants yet: ${problems.slice(0, 4).join("; ")}` }, 400);
     }
     const provider = deps.providers.get(body.provider || undefined);
-    let parsed = await parseSop(provider, text, pack.data, generic ? hintsFor(datasetId) : undefined);
+    const meter = builderMeter();
+    const metered = { onUsage: meter.onUsage };
+    let parsed = await parseSop(provider, text, pack.data, generic ? hintsFor(datasetId) : undefined, metered);
     let toolChecks = generic ? await checkTools(parsed.rulebook) : undefined;
     // Build time: if the model named a tool no connected service has (or left out what it needs), look up
     // the real tools for those rules on the connected services and let it try once more with them.
@@ -233,7 +297,7 @@ export function createApp(deps: AppDeps) {
       const found = (await Promise.all(titles.map((t) => deps.connectors.suggestTools(t, 4)))).flat();
       const tools = [...new Map(found.map((t) => [t.slug, t])).values()];
       if (tools.length) {
-        const retry = await parseSop(provider, text, pack.data, { ...hintsFor(datasetId), tools });
+        const retry = await parseSop(provider, text, pack.data, { ...hintsFor(datasetId), tools }, metered);
         const retryChecks = await checkTools(retry.rulebook);
         const bad = (cs: typeof retryChecks) => cs.filter((t) => t.status === "not_found" || t.status === "missing_args").length;
         if (bad(retryChecks) < gaps.length) {
@@ -243,6 +307,7 @@ export function createApp(deps: AppDeps) {
       }
     }
     const id = newId("rb");
+    meter.tag(id);
     store.data.rulebooks[id] = {
       id,
       sop: text,
@@ -293,6 +358,7 @@ export function createApp(deps: AppDeps) {
     if (!parent) return c.json({ error: "not found" }, 404);
     const body = await c.req.json<{ text?: string; rulebook?: unknown; provider?: string }>();
     const pack = packOf(parent.rulebook);
+    const meter = builderMeter();
     let rulebook: Rulebook;
     let provider: string;
     if (body.rulebook !== undefined) {
@@ -303,13 +369,17 @@ export function createApp(deps: AppDeps) {
       provider = "edited by the owner";
     } else {
       if (!body.text || body.text.trim().length < 20) return c.json({ error: "the revised SOP text is required" }, 400);
-      const parsed = await parseSop(deps.providers.get(body.provider || undefined), body.text, pack, pack === "generic" ? hintsFor(parent.datasetId) : undefined);
+      const parsed = await parseSop(deps.providers.get(body.provider || undefined), body.text, pack, pack === "generic" ? hintsFor(parent.datasetId) : undefined, { onUsage: meter.onUsage });
       rulebook = parsed.rulebook;
       provider = parsed.provider;
     }
     const diff = diffRulebooks(parent.rulebook, rulebook);
-    if (diff.length === 0) return c.json({ error: "no rule changed in this revision" }, 409);
+    if (diff.length === 0) {
+      meter.tag(parent.id); // the model was still called: the cost belongs to the version it was asked about
+      return c.json({ error: "no rule changed in this revision" }, 409);
+    }
     const id = newId("rb");
+    meter.tag(id);
     store.data.rulebooks[id] = {
       id,
       sop: body.text ?? parent.sop,
@@ -363,7 +433,7 @@ export function createApp(deps: AppDeps) {
         run.receipt = attempt.receipt;
         const entry = ledger.append({ kind: "receipt", at: attempt.receipt.created_at, receipt_hash: attempt.receipt.receipt_hash, run_id: run.id, verdict: attempt.verdict.status });
         run.ledgerSeq = entry.seq;
-        const receipts = ledger.entries().flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+        const receipts = anchorLeaves(ledger.entries());
         const root = merkleRoot(receipts);
         const anchor = ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: root, leaves: receipts.length, anchor: "local-ledger" });
         say(`receipt ${attempt.receipt.receipt_hash.slice(0, 16)}… → ledger #${entry.seq}; merkle root ${root.slice(0, 16)}… → ledger #${anchor.seq}`);
@@ -404,7 +474,7 @@ export function createApp(deps: AppDeps) {
 
   app.post("/ledger/anchor", async (c) => {
     if (!deps.anchor) return c.json({ error: "no anchor wallet: run `npm run anchor:wallet`, fund the address from the testnet faucet, restart the API" }, 409);
-    const receipts = ledger.entries().flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+    const receipts = anchorLeaves(ledger.entries());
     if (receipts.length === 0) return c.json({ error: "no receipts to anchor yet" }, 409);
     const root = merkleRoot(receipts);
     let published;
@@ -433,7 +503,7 @@ export function createApp(deps: AppDeps) {
     const entries = ledger.entries();
     const entry = entries.find((e) => e.seq === seq);
     if (!entry || entry.kind !== "anchor") return c.json({ error: "no anchor entry at that position" }, 404);
-    const receipts = entries.filter((e) => e.seq < seq).flatMap((e) => (e.kind === "receipt" ? [e.receipt_hash] : []));
+    const receipts = anchorLeaves(entries.filter((e) => e.seq < seq));
     const local = merkleRoot(receipts.slice(0, entry.leaves)) === entry.merkle_root && ledger.verify() === null;
     if (!entry.tx) return c.json({ seq, local, onChain: null, reason: "anchored in the local ledger only" });
     if (!deps.anchor || deps.anchor.chainName !== entry.anchor) return c.json({ error: `this API has no ${entry.anchor} anchor wallet to read with` }, 409);
@@ -548,8 +618,29 @@ export function createApp(deps: AppDeps) {
     if (!entry) throw new OperatorError(`unknown rail ${id}`);
     if (!entry.info.available) throw new OperatorError(`${entry.info.label} is not set up: add ${entry.info.setup} to reeve/.env`);
     let rail = railCache.get(id);
-    if (!rail) railCache.set(id, (rail = entry.create()));
+    if (!rail) railCache.set(id, (rail = withMerchantAccount(entry.create(), () => store.data.railAccounts?.[id])));
     return rail;
+  };
+
+  /**
+   * Reeve never holds a merchant's money. A rail that bills per merchant (Xendit xenPlatform) is called with this
+   * workspace owner's own sub-account on every invoice, lookup, refund and payout; with none connected it refuses
+   * (SubAccountRequiredError, in Indonesian) before any request leaves.
+   */
+  const withMerchantAccount = (rail: PaymentRail, account: () => string | undefined): PaymentRail => {
+    if (!rail.perMerchantAccount) return rail;
+    const ctx = () => ({ account: account() });
+    return {
+      name: rail.name,
+      testMode: rail.testMode,
+      perMerchantAccount: true,
+      createInvoice: (req) => rail.createInvoice(req, ctx()),
+      getInvoice: (invoiceId) => rail.getInvoice(invoiceId, ctx()),
+      refund: (invoice, amount, key) => rail.refund(invoice, amount, key, ctx()),
+      ...(rail.simulatePayment ? { simulatePayment: (invoiceId: string) => rail.simulatePayment!(invoiceId, ctx()) } : {}),
+      ...(rail.payout ? { payout: (req: Parameters<NonNullable<PaymentRail["payout"]>>[0]) => rail.payout!(req, ctx()) } : {}),
+      parseWebhook: (raw, headers) => rail.parseWebhook(raw, headers),
+    };
   };
 
   /** Everything the Operator needs for one operation, re-checked on every call. */
@@ -568,10 +659,32 @@ export function createApp(deps: AppDeps) {
     const roster = op.tenants.every((t) => t.rent !== undefined && t.move_in) ? (op.tenants as Tenant[]) : deps.tenants(packOf(rb.rulebook));
     return new Operator(op, rb.rulebook, roster, {
       rail: railFor(op.rail),
-      runRules: (scenario) => runOperate({ repoRoot, rulesPy, constraintsJson, scenario, sandbox: deps.sandbox, onLog }),
+      runRules: (scenario) => sandboxed(() => runOperate({ repoRoot, rulesPy, constraintsJson, scenario, sandbox: deps.sandbox, onLog })),
       record: (b) => ledger.append({ kind: "operation", at: new Date().toISOString(), operation_id: op.id, rail: op.rail, receipt_hash: op.receiptHash, ...b }),
       save: () => store.save(),
+      // Bills, reminders and notices go out through the same connector registry the generic pack uses.
+      send: (call) => deps.connectors.execute(call.connector, call.tool, call.args),
+      ...llmHooks({ rulebookId: op.rulebookId, operationId: op.id }),
     });
+  };
+
+  /** Drafting and reply reading, only when switched on and the default provider can complete text. Each call's tokens go to the cost meter under `tags`. */
+  const llmHooks = (tags: { rulebookId: string; operationId: string }) => {
+    let complete: ReturnType<typeof completerOf> = null;
+    try {
+      // Cheap by default: Haiku-class, never the default Opus/Sonnet. Another model only when the owner names one.
+      let provider: ReturnType<typeof deps.providers.get> | undefined;
+      try {
+        provider = deps.providers.get(deps.operatorModel ?? "anthropic:claude-haiku-5-5");
+      } catch {
+        const fallback = deps.providers.get();
+        provider = deps.operatorModel || !/^anthropic:claude-(opus|sonnet)/.test(fallback.name) ? fallback : undefined;
+      }
+      complete = completerOf(provider, deps.operatorLlm === true, (phase, u) => recordUsage(phase, u, tags));
+    } catch {
+      complete = null;
+    }
+    return complete ? { draft: drafterFor(complete), classify: classifierFor(complete) } : {};
   };
 
   const operationError = (c: { json: (b: unknown, s: 400 | 403 | 404 | 409 | 502) => Response }, err: unknown) => {
@@ -580,19 +693,77 @@ export function createApp(deps: AppDeps) {
     return c.json({ error: `rail error: ${err instanceof Error ? err.message : String(err)}` }, 502);
   };
 
-  app.get("/rails", (c) => c.json(deps.rails.map((r) => r.info)));
+  // `account` says whether this owner has connected their own sub-account on a per-merchant rail (the id itself stays server-side).
+  app.get("/rails", (c) => c.json(deps.rails.map((r) => ({ ...r.info, ...(r.info.id === "xendit" ? { perMerchantAccount: true, accountConnected: !!store.data.railAccounts?.xendit } : {}) }))));
+
+  // The owner's own Xendit xenPlatform sub-account (user id). Invoices are made on it with `for-user-id`, so the money
+  // settles there and never in Reeve's balance. https://docs.xendit.co/docs/accepting-payments-for-sub-accounts
+  app.get("/rails/xendit/account", (c) => c.json({ connected: !!store.data.railAccounts?.xendit, accountId: store.data.railAccounts?.xendit ?? null }));
+  app.put("/rails/xendit/account", async (c) => {
+    const { accountId } = await c.req.json<{ accountId?: unknown }>().catch(() => ({ accountId: undefined }));
+    const id = typeof accountId === "string" ? accountId.trim() : "";
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) return c.json({ error: "accountId must be your Xendit sub-account id (the user id from xenPlatform), 8-64 letters or digits" }, 400);
+    store.data.railAccounts = { ...store.data.railAccounts, xendit: id };
+    store.save();
+    return c.json({ connected: true, accountId: id });
+  });
+  app.delete("/rails/xendit/account", (c) => {
+    if (Object.values(store.data.operations).some((o) => o.rail === "xendit" && o.invoices.some((i) => i.status === "open"))) return c.json({ error: "open Xendit bills still belong to this account; settle or expire them first" }, 409);
+    if (store.data.railAccounts) delete store.data.railAccounts.xendit;
+    store.save();
+    return c.json({ connected: false, accountId: null });
+  });
+
+  const schedulerCfg: SchedulerConfig = deps.scheduler ?? { enabled: false, daySeconds: 86_400, tickMs: 60_000, maxFailures: 3 };
+  /** The operation as the studio sees it: the stored record plus where the scheduler's clock stands. */
+  const withScheduler = (op: OperationRecord | GenericOperationRecord) => ({ ...op, scheduler: schedulerView(op as Scheduled<typeof op>, schedulerCfg, Date.now()) });
+
+  app.get("/scheduler", (c) => c.json({ enabled: schedulerCfg.enabled, daySeconds: schedulerCfg.daySeconds, tickMs: schedulerCfg.tickMs }));
 
   app.get("/operations", (c) =>
     c.json(
       [...Object.values(store.data.operations), ...Object.values(store.data.genericOperations)]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .slice(0, 20),
+        .slice(0, 20)
+        .map(withScheduler),
     ),
   );
 
   app.get("/operations/:id", (c) => {
     const op = store.data.operations[c.req.param("id")] ?? store.data.genericOperations[c.req.param("id")];
-    return op ? c.json(op) : c.json({ error: "not found" }, 404);
+    return op ? c.json(withScheduler(op)) : c.json({ error: "not found" }, 404);
+  });
+
+  // The owner says they sent a prepared WhatsApp message from their own phone. Reeve cannot see WhatsApp, so this is the
+  // owner's word, written on the ledger as such. Marking the same message again changes nothing (`changed` is false).
+  app.post("/operations/:id/messages/:messageId/sent", (c) => {
+    const rent = store.data.operations[c.req.param("id")] as RentOperationRecord | undefined;
+    const op = rent ?? (store.data.genericOperations[c.req.param("id")] as GenericOperation | undefined);
+    if (!op) return c.json({ error: "not found" }, 404);
+    if (!op.prepared?.some((m) => m.id === c.req.param("messageId"))) return c.json({ error: "no such prepared message" }, 404);
+    const now = new Date();
+    const { message, changed } = markPreparedSent(op.prepared, c.req.param("messageId"), {
+      now,
+      record: (b) => ledger.append({ kind: "operation", at: now.toISOString(), operation_id: op.id, rail: rent ? rent.rail : "connectors", receipt_hash: op.receiptHash, ...b }),
+      save: () => store.save(),
+    });
+    return c.json({ message, operation: op, changed });
+  });
+
+  // ── Cost meter: what the model calls cost (tokens and price from the providers' own numbers), against the steps plain code ran. ──
+  const usageOf = (q: { rulebookId?: string; operationId?: string; month?: string }) =>
+    summarize(store.data.usage ?? [], [...Object.values(store.data.operations), ...Object.values(store.data.genericOperations)], q, new Date(), fxRate(env));
+
+  // Whole workspace, or narrowed with ?rulebookId= and/or ?operationId=; ?month=YYYY-MM picks the month (default: this month, Jakarta time).
+  app.get("/usage", (c) => {
+    const month = c.req.query("month");
+    if (month && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) return c.json({ error: "month must look like 2026-11" }, 400);
+    return c.json(usageOf({ rulebookId: c.req.query("rulebookId") || undefined, operationId: c.req.query("operationId") || undefined, month: month || undefined }));
+  });
+
+  app.get("/rulebooks/:id/usage", (c) => {
+    if (!store.data.rulebooks[c.req.param("id")]) return c.json({ error: "not found" }, 404);
+    return c.json(usageOf({ rulebookId: c.req.param("id") }));
   });
 
   // Start a run of the approved rulebook on a rail. Nothing is billed until the clock advances.
@@ -606,12 +777,29 @@ export function createApp(deps: AppDeps) {
       store.save();
       return c.json(op, 201);
     }
-    if (packOf(rb.rulebook) !== "rent-collection") return c.json({ error: "running on a payment rail is built for rent collection so far; minimarket purchase orders come next" }, 409);
+    if (packOf(rb.rulebook) === "minimarket") {
+      // Purchase orders go to suppliers through the connector registry (Telegram / Gmail, or the log for a supplier without a contact).
+      type SupplierBody = Record<string, { telegram_chat_id?: unknown; email?: unknown; whatsapp?: unknown }>;
+      const body = await c.req.json<{ suppliers?: SupplierBody }>().catch(() => ({}) as { suppliers?: SupplierBody });
+      const suppliers: Record<string, { telegram_chat_id?: string; email?: string; whatsapp?: string }> = {};
+      for (const [id, v] of Object.entries(body.suppliers ?? {})) {
+        const telegram = typeof v?.telegram_chat_id === "string" || typeof v?.telegram_chat_id === "number" ? String(v.telegram_chat_id).trim() : "";
+        const email = typeof v?.email === "string" ? v.email.trim() : "";
+        const whatsapp = typeof v?.whatsapp === "string" || typeof v?.whatsapp === "number" ? String(v.whatsapp).trim() : "";
+        if (telegram || email || whatsapp) suppliers[id] = { ...(telegram ? { telegram_chat_id: telegram } : {}), ...(email ? { email } : {}), ...(whatsapp ? { whatsapp } : {}) };
+      }
+      const op = { ...newGenericOperation({ id: newId("op"), rulebookId: rb.id, receiptHash: rb.approval.receiptHash, datasetId: "sample", startDate: deps.scenario("minimarket").start_date }), suppliers };
+      store.data.genericOperations[op.id] = op;
+      store.save();
+      return c.json(op, 201);
+    }
+    if (packOf(rb.rulebook) !== "rent-collection") return c.json({ error: "this rulebook's pack cannot run on a rail yet" }, 409);
     const run = rb.lastRunId ? store.data.runs[rb.lastRunId] : undefined;
     if (!run?.receipt || run.receipt.receipt_hash !== rb.approval.receiptHash) return c.json({ error: "the approved run is missing" }, 409);
     const { rail } = await c.req.json<{ rail?: string }>().catch(() => ({ rail: undefined }));
     try {
-      railFor(rail ?? "mock");
+      // A per-merchant rail needs the owner's own account before a run can even start.
+      if (railFor(rail ?? "mock").perMerchantAccount && !store.data.railAccounts?.[rail ?? "mock"]) throw new SubAccountRequiredError(rail === "xendit" ? "Xendit" : (rail ?? ""));
     } catch (err) {
       return operationError(c, err);
     }
@@ -629,6 +817,11 @@ export function createApp(deps: AppDeps) {
       rail: rail ?? "mock",
       startDate: firstInvoice ?? deps.scenario("rent-collection").start_date,
       tenants: roster,
+      // Telegram chat ids / emails from the owner's tenant sheet (rows line up with the roster); none for the sample.
+      contacts: (() => {
+        const ds = rb.datasetId ? store.data.datasets[rb.datasetId] : undefined;
+        return ds && ds.records.length === roster.length ? contactsFromRecords(ds.records, roster.map((t) => t.id)) : {};
+      })(),
     });
     store.data.operations[op.id] = op;
     store.save();
@@ -694,6 +887,53 @@ export function createApp(deps: AppDeps) {
     } catch (err) {
       return operationError(c, err);
     }
+  });
+
+  // A tenant's reply to one of our messages. The Operator reads its intent and does only what the approved rules allow; the rest waits for the owner.
+  app.post("/operations/:id/replies", async (c) => {
+    const op = store.data.operations[c.req.param("id")];
+    if (!op) return c.json({ error: "not found" }, 404);
+    const body = await c.req.json<{ tenant?: string; text?: string }>().catch(() => ({}) as { tenant?: string; text?: string });
+    if (!body.tenant || !body.text?.trim()) return c.json({ error: "tenant and text are required" }, 400);
+    try {
+      return c.json(await operatorFor(op).handleReply(body.tenant, body.text), 201);
+    } catch (err) {
+      return operationError(c, err);
+    }
+  });
+
+  app.post("/operations/:id/replies/:replyId/resolve", (c) => {
+    const op = store.data.operations[c.req.param("id")];
+    if (!op) return c.json({ error: "not found" }, 404);
+    try {
+      return c.json(operatorFor(op).resolveReply(c.req.param("replyId")));
+    } catch (err) {
+      return operationError(c, err);
+    }
+  });
+
+  // Telegram bot webhook: a tenant's message goes to the operation whose tenant has that chat id. Off unless TELEGRAM_WEBHOOK_SECRET is set.
+  app.post("/webhooks/telegram", async (c) => {
+    const secret = deps.telegramWebhookSecret;
+    if (!secret) return c.json({ error: "the Telegram webhook is not configured (set TELEGRAM_WEBHOOK_SECRET)" }, 409);
+    const sent = Buffer.from(c.req.header("x-telegram-bot-api-secret-token") ?? "");
+    const want = Buffer.from(secret);
+    if (sent.length !== want.length || !timingSafeEqual(sent, want)) return c.json({ error: "bad secret token" }, 401);
+    const update = await c.req.json<{ message?: { chat?: { id?: number | string }; text?: string } }>().catch(() => ({}) as { message?: { chat?: { id?: number | string }; text?: string } });
+    const chat = update.message?.chat?.id;
+    const text = update.message?.text;
+    if (chat === undefined || !text) return c.json({ ignored: true });
+    for (const op of Object.values(store.data.operations) as RentOperationRecord[]) {
+      const tenant = Object.entries(op.contacts ?? {}).find(([, ct]) => ct.telegram_chat_id && String(ct.telegram_chat_id) === String(chat))?.[0];
+      if (!tenant) continue;
+      try {
+        const reply = await operatorFor(op).handleReply(tenant, text);
+        return c.json({ ok: true, reply: reply.id, action: reply.action, status: reply.status });
+      } catch (err) {
+        return operationError(c, err);
+      }
+    }
+    return c.json({ ignored: true });
   });
 
   // Test mode: pay one bill as the tenant would (Stripe test card; Xendit after a channel was picked).
@@ -806,8 +1046,9 @@ export function createApp(deps: AppDeps) {
     if (sha256(rulesPy) !== run.receipt.files["rules.py"]) throw new OperatorError("rules.py does not match the approved receipt");
     const constraintsJson = prepareAudit(rb.rulebook, rulesPy).files["constraints.json"]!;
     return new GenericOperator(op, rb.rulebook, {
-      runRules: (scenario) => runOperate({ repoRoot, rulesPy, constraintsJson, scenario, sandbox: deps.sandbox, onLog: (line) => op.log.push({ at: new Date().toISOString(), line }) }),
+      runRules: (scenario) => sandboxed(() => runOperate({ repoRoot, rulesPy, constraintsJson, scenario, sandbox: deps.sandbox, onLog: (line) => op.log.push({ at: new Date().toISOString(), line }) })),
       execute: (connector, tool, args) => deps.connectors.execute(connector, tool, args),
+      ...(packOf(rb.rulebook) === "minimarket" ? { pack: minimarketPack(deps.scenario("minimarket") as StockScenario, (op as GenericOperationRecord & { suppliers?: SupplierContacts }).suppliers ?? {}) } : {}),
       // A dataset read from an app is read again on every step, so the rules see today's rows.
       records: async () => {
         const d = store.data.datasets[op.datasetId];
@@ -928,6 +1169,10 @@ export function createApp(deps: AppDeps) {
     if (!event) return c.json({ ignored: true });
     for (const op of Object.values(store.data.operations).filter((o) => o.rail === id)) {
       if (!op.invoices.some((i) => i.invoiceId === event.invoiceId)) continue;
+      // A bill settled in someone else's sub-account (or one that names none) is not this owner's money: reject it.
+      if (railFor(id).perMerchantAccount && (!event.account || event.account !== store.data.railAccounts?.[id])) {
+        return c.json({ error: "this event's sub-account does not match the owner of the operation; ignored" }, 403);
+      }
       try {
         operatorFor(op).handleEvent(event);
       } catch (err) {
@@ -938,5 +1183,77 @@ export function createApp(deps: AppDeps) {
     return c.json({ ignored: true, reason: "no operation sent this bill" });
   });
 
-  return app;
+  // ── The scheduler: advances every operation up to its business date, the same way the manual endpoints do. ──
+
+  // Operations advance independently: one slow operation (many messages, a slow model) never holds up the others,
+  // and an operation is never advanced twice at once. Only the sandbox itself is single-file (see `sandboxed`).
+  const inFlight = new Set<string>();
+  /** One pass over the operations as they are now (new ones are picked up on the next pass). Returns the ids advanced. */
+  const schedulerTick = async (nowMs = Date.now()): Promise<string[]> => {
+    const ops: Scheduled<OperationRecord | GenericOperationRecord>[] = [...Object.values(store.data.operations), ...Object.values(store.data.genericOperations)];
+    const results = await Promise.all(ops.map((op) => (inFlight.has(op.id) ? null : scheduleOne(op, nowMs))));
+    return results.filter((id): id is string => !!id);
+  };
+
+  const scheduleOne = async (op: Scheduled<OperationRecord | GenericOperationRecord>, nowMs: number): Promise<string | null> => {
+    inFlight.add(op.id);
+    try {
+      {
+        const memo = memoOf(op);
+        // A manual advance since the pause means someone is looking at it again.
+        if (memo.paused && memo.pausedAt !== op.clock) Object.assign(memo, { paused: false, failures: 0, pausedAt: undefined });
+        const to = dueTarget(op, schedulerCfg, nowMs);
+        if (!to) return null;
+        const generic = "kind" in op && op.kind === "generic";
+        let run: (to: string) => Promise<unknown>;
+        try {
+          if (generic) {
+            const operator = genericOperatorFor(op as GenericOperationRecord);
+            run = (d) => operator.advance(d);
+          } else {
+            const operator = operatorFor(op as OperationRecord, (line) => op.log.push({ at: new Date().toISOString(), line }));
+            run = (d) => operator.advance(d);
+          }
+        } catch (err) {
+          // The approved rulebook is gone or superseded: nothing to run until the owner acts.
+          Object.assign(memo, { lastError: err instanceof Error ? err.message : String(err), paused: true, pausedAt: op.clock });
+          store.save();
+          return null;
+        }
+        op.status = "running";
+        delete op.error;
+        store.save();
+        let failure: unknown;
+        try {
+          await run(to);
+        } catch (err) {
+          failure = err ?? new Error("advance failed");
+        }
+        if (failure === undefined) {
+          op.status = "idle";
+          memo.failures = 0;
+          delete memo.lastError;
+          memo.lastAdvanceAt = new Date().toISOString();
+          memo.lastTarget = to;
+          store.save();
+          return op.id;
+        } else {
+          const message = failure instanceof Error ? failure.message : String(failure);
+          op.status = "error";
+          op.error = message;
+          memo.lastError = message;
+          memo.failures += 1;
+          // Retried on the next tick; after maxFailures in a row it waits for the owner.
+          if (memo.failures >= schedulerCfg.maxFailures) Object.assign(memo, { paused: true, pausedAt: op.clock });
+        }
+        store.save();
+      }
+    } finally {
+      inFlight.delete(op.id);
+    }
+    return null;
+  };
+  if (schedulerCfg.enabled) setInterval(() => void schedulerTick(), schedulerCfg.tickMs).unref();
+
+  return Object.assign(app, { schedulerTick });
 }

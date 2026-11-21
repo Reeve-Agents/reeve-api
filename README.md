@@ -9,6 +9,78 @@
 
 Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Design notes live in the private reeve-vault repo.
 
+## Reeve on Meko (ContextCon 2027, challenge 07 "Show Your Work")
+
+Reeve's agents now do work, not only watch: they fill a vacant room, run daily content, answer prospects and explain their own decisions. Every turn is a [Meko](https://mekodata.ai) trace with its reasoning, and every trace is bound to Reeve's hash-chained receipt ledger, so **Meko tells you why, and Reeve proves it was not rewritten.**
+
+> **What existed before 7 Nov 2026.** The Builder, the Auditor with planted defects, the Operator (broker), the payment rails, the receipt ledger, the Monad testnet anchor and the web studio were built before ContextCon, for earlier hackathons (this repo was imported on 20 Oct 2026). Everything Meko-related is new and lives on branch `feat/meko-active-crew`, in dated commits from 21 Nov 2026: `packages/meko`, `packages/crew`, `apps/api/src/meko.ts`, `apps/cli/src/crew-demo.ts`, the `decision` ledger entry and the `?view=jejak` page in reeve-web.
+
+```mermaid
+flowchart LR
+  SOP["Owner SOP / target"] --> B["Builder"] --> A["Auditor<br/>planted defects"] --> O["Owner passkey"]
+  O --> OP["Operator (code decides)"]
+  OP -- "context_search first" --> M[("Meko datapack<br/>reeve-kos-melati")]
+  OP --> W["Worker (LLM words only)"] --> V["Validator (code)"]
+  B & A & O & OP & W & V & ASK["Tanya usaha (read-only)"] -- "turn + reasoning<br/>metadata: reeve_receipt" --> M
+  B & A & O & OP & W & V & ASK -- "decision entry<br/>trace_hash" --> L[("Receipt ledger<br/>hash chain")]
+  L -- "Merkle root" --> C["Monad testnet anchor"]
+  M & L --> R["Rapor Usaha + Jejak keputusan"]
+```
+
+| Meko feature | How Reeve uses it |
+|---|---|
+| Datapack | One per workspace: `reeve-<workspace>` (`reeve-kos-melati`). |
+| Conversations + `reasoning` | One conversation per agent per run (Builder, Auditor, owner, Operator, Worker, Validator, Ask), tied by `run_id`, each agent in its own session. Every decision has `reasoning`, so Meko shows a Decision trace card. |
+| `context_search` | The Operator searches before it acts: owner exceptions before a late fee, a prospect's history before a reply, past content results before a plan. The hits are hashed into the decision. |
+| Memory + `memory_promote` | Owner exceptions ("Kamar 3 boleh telat sampai 10 hari"), prospect histories (pseudonymised), content results, autonomy changes. Promoted memories are shared by every agent. |
+| Learning | Playbook C reads which hook brought the most chats from shared memory and picks the next post's hook from it. |
+| Artifacts (SHA-256) | Audit reports, contract drafts, the Rapor Usaha. |
+| `track_token_usage` | Called for every Worker LLM call when the server offers it (Meko Cloud); on local Meko the usage stays in the message metadata. |
+| Decision tracing | `GET /api/meko/public/decisions/:receipt` and `?view=jejak` rebuild one decision with its chain, what it looked up, and the proof. |
+
+**Tamper-evident traces.** For each turn Reeve hashes exactly what Meko stores (`input`, `output`, `reasoning`, `plan`, and the ids of what `context_search` returned) and appends a `decision` entry with that `trace_hash` to the hash-chained ledger. The entry's hash is the receipt, written back into the Meko message as `metadata.reeve_receipt`. `verifyDecision` re-reads the message from Meko, recomputes the hash, checks the chain and the Merkle proof against the first anchor after it. Edit the reasoning in Meko, or a ledger line, and the check names which one changed.
+
+**What the crew does on Kos Melati** (synthetic 30-room kos, pseudonymised):
+
+- **Playbook B, "kamar kosong terisi sendiri"**: vacancy, listing drafted by the Worker and checked by the Validator, owner review, publish, CS on whitelisted intents only (escalations win), viewing booked, Rp500.000 deposit on the test-mode rail within the approved bound, contract draft, owner passkey. It stops itself at its target.
+- **Playbook C, content loop**: plan from business truth (room vacant longest, paydays, campus calendar), script and caption, Validator, owner review, publish, measure (simulated), learn.
+- **Auditor for playbooks**: worst-case budget math, review on every publish or payment, a stop condition, reachability of every step, and planted violations plus bad drafts that must all be caught.
+- **Earned autonomy** per action class (`ask`, `ask_if_unusual`, `auto_digest`, `auto`), promoted only on clean receipts with the owner's passkey, demoted on any override, complaint or 10-minute undo.
+- **Tanya usaha**: a read-only agent that answers "kenapa saya didenda?" from the trace, with a link to the proof.
+- **One payment-plan bound**: "maksimal 2 cicilan, lunas sebelum tanggal 25", audited with planted bad offers; offers inside it cite it, the rest go to the owner.
+- **Rapor Usaha**: the audit report generated from traces and receipts, stored in Meko as an artifact.
+
+### Run it
+
+```bash
+export MEKO_CONTEXT_ENGINE_DIR=$HOME/.local/share/meko/app/current/context_engine
+export MEKO_WEB_UI_DIR=$HOME/.local/share/meko/app/current/web_ui/dist
+meko start
+```
+
+```bash
+npm run crew:demo -- --fresh
+```
+
+```bash
+npm run dev
+```
+
+Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/api/meko/public/report.html`. Add `--llm` to let Claude Haiku 5.5 word the drafts (needs `ANTHROPIC_API_KEY`). For Meko Cloud set `MEKO_API_KEY` (and optionally `MEKO_MCP_URL`) in `.env`; without it the local Meko and `meko token` are used. `REEVE_MEKO_PUBLIC_ASK=on` opens `POST /api/meko/public/ask`.
+
+### Measured on Kos Melati (local Meko 1.20261116.0, 21 Nov 2026, `crew:demo --llm`)
+
+| | |
+|---|---|
+| Traced decisions in Meko | 79, all verified against their receipts |
+| SOP audit | 61/61 planted defects caught, 11 spec cases (local sandbox) |
+| Playbook audits | B: 19/19 planted violations and 12/12 bad drafts caught; C: 13/13 and 12/12 |
+| LLM calls | 6 Worker drafts (Claude Haiku 5.5), 1,605 input + 2,813 output tokens, every draft passed the Validator |
+| Model calls | 6 of 79 turns, all wording drafts; no model call decides whether to act |
+| `context_search` | 26 searches before acting |
+
+Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
+
 ## Quick start
 
 Requires Node ≥ 20 and Python ≥ 3.9.
@@ -80,7 +152,7 @@ After approval, **06 · Run** bills the tenants for real on a payment rail. Reev
 
 - **Invoice:** a bill on the rail with a hosted payment page.
 - **Late fee:** a separate bill.
-- **Reminder or notice:** logged only, because no WhatsApp or email connector exists yet.
+- **Bill, late fee, reminder, notice:** sent to the tenant through the connector registry, Telegram first, else Gmail, else logged (see "The Operator in practice" below). A bill message carries the payment link.
 - **Overpayment:** an exception. Keeping it as credit needs no approval; a refund above the rulebook's limit needs the owner's passkey.
 
 If the rules break a constraint, nothing is sent. Every step goes on the ledger.
@@ -92,6 +164,18 @@ If the rules break a constraint, nothing is sent. Every step goes on the ledger.
 | Offline | nothing | In-memory bills, for demos without a key |
 
 Live keys are refused. Without a webhook secret, **Check payments** polls the rail. `npm run rails:smoke -- --rail=stripe` (or `xendit`) creates one Rp10.000 bill, pays it and refunds half, to check a key before a demo. `npm run preview:seed` builds a separate store in `.reeve/preview` with a simulated approval, for trying the Run panel without a passkey (`reeve-api-preview` in `.claude/launch.json`).
+
+### The Operator in practice (11 Nov 2026)
+
+- **Scheduler.** Off by default. `REEVE_SCHEDULER=on` advances every running operation by itself, one business day per `REEVE_SCHEDULER_DAY_SECONDS` (default 86400; set 30 for a demo: a day passes every 30 s). `REEVE_SCHEDULER_TICK_MS` is how often it checks. The manual "advance" button still works; `GET /api/scheduler` and each operation's `scheduler` field show where the clock stands. Three failures in a row pause that operation.
+- **Messages.** Tenant contacts come from the sheet's `telegram_chat_id` and `email` columns. A message goes to Telegram (`TELEGRAM_SEND_MESSAGE`), else Gmail (`GMAIL_SEND_EMAIL`), else the Log connector. It is only really sent when that connector has a connected account (Composio key plus a connected Telegram or Gmail); otherwise it is logged and the action says "logged". The sample tenants have no contacts, so they always log. Only these tools can be called.
+- **Payments as tools.** `XENDIT_CREATE_INVOICE`, `STRIPE_CREATE_INVOICE` and `MOCK_CREATE_INVOICE` exist on the `payments` connector, on the same rails and test keys as the rent pack (live keys refused). A generic rule card can call them; the approval limit and passkey hold apply as for any action. The pay link is stored on the action.
+- **Minimarket** runs through the generic Operator: purchase orders become supplier messages (`po_created` sent, `po_approval_request` held for the owner's passkey). Supplier contacts are given when the run starts (`{"suppliers": {"A": {"telegram_chat_id": "…"}}}`); without one the order is logged.
+- **LLM in the Operator, off by default.** `REEVE_OPERATOR_LLM=on` plus a provider with a key. It does two things only: rephrases an approved message in Bahasa Indonesia (the draft is thrown away if it loses the amount or the payment link), and reads a tenant's reply into `promise_to_pay`, `already_paid`, `asks_relief` or `unclear`. The rulebook still decides whether, when and to whom; the model never sets amounts, dates of rules or recipients. Cost is bounded: it uses a Haiku-class model by default (`REEVE_OPERATOR_MODEL`, default `anthropic:claude-haiku-5-5`; the default Opus or Sonnet is never used for this), words each message kind once per advance with `{{name}} {{room}} {{amount}} {{link}}` placeholders filled by plain code (30 bills cost a few calls, not 30, and the model never sees a tenant's name or amount), and stops at a call cap per advance. A reply the model cannot read is recorded with its real error (`error` on the reply, `model_error` in the ledger and a server warning), and "No language model is configured" appears only when there truly is none. Without a model, messages use the plain template and every reply goes to the owner.
+- **Webhooks bypass the session gate.** `POST /api/webhooks/telegram` and `/api/webhooks/:rail` need no login; each authenticates by its own secret or signature inside the workspace that owns the bill. A message that cannot be sent in the generic or minimarket path is kept on the Log connector, like rent. The scheduler advances each operation independently (never twice at once, new ones picked up on the next tick); only the sandbox itself runs one job at a time.
+- **Replies.** `POST /api/operations/:id/replies` `{tenant, text}`, and the Telegram bot webhook `POST /api/webhooks/telegram` (needs `TELEGRAM_WEBHOOK_SECRET`, the same value as the `secret_token` given to Telegram's `setWebhook`; unset means 409). `promise_to_pay` with a date in the next 30 days holds the reminders for that bill until then; `already_paid` asks the rail; `asks_relief`, `unclear`, a bill above the rulebook's approval limit (no limit card means 0) and anything without a model go to the owner (`status: waiting_owner`, `POST …/replies/:rid/resolve` closes it). Nothing is sent back to the tenant automatically. Every reply and action is on the ledger (`reply_received`, `reply_actioned`).
+- **Cost meter** (`GET /api/usage`, session-gated; narrow it with `?rulebookId=` or `?operationId=`, pick a month with `?month=2026-11`; `GET /api/rulebooks/:id/usage` is the same for one rulebook). Every model call, Builder or Operator, writes one record (`usage` in the workspace store) from the provider's own `usage` block: Claude `input_tokens` / `output_tokens` plus the cache fields, OpenAI-compatible `prompt_tokens` / `completion_tokens`, the offline sample zero. Each record is tagged with its phase (`builder_compile`, `operator_draft`, `operator_classify`), the rulebook, the operation and the workspace. The USD price is per million tokens, from the Claude API price table (checked 11 Nov 2026): Opus 5.5 $4 / $20, Sonnet 5.5 $2 / $10, Haiku 5.5 $0.10 / $0.50 (a prompt over 100K tokens: $0.50 / $2.50, the whole call), Fable 5.2 $8 / $40; cache writes count 1.25x and reads 0.1x the input price. A model outside that table (Groq, Ollama, ...) keeps its tokens and has **no cost** ("tidak diketahui") unless `REEVE_PRICE_OVERRIDES` names one. Rupiah is USD times `REEVE_USD_IDR` (default 18154, JISDOR BI, 11 Nov 2026; set `REEVE_USD_IDR_DATE` with your own rate); the response always carries the rate and its date. The response also counts the **deterministic steps** the rules and plain code carried out (bills, messages, credits, exceptions; blocked or failed ones are not counted) so the studio can say "42 langkah dijalankan kode, 3 panggilan AI". Months are Jakarta time. Only measured numbers: no estimate, no comparison.
+- **WhatsApp click-to-send.** Reeve never sends on WhatsApp. When a tenant sheet has a `whatsapp`, `wa`, `phone`, `no_hp` (and similar) column, and no automatic channel delivered the message (Telegram, then Gmail; none on file, nothing connected, or the send failed), the Operator prepares `https://wa.me/<digits>?text=<message>` instead of the Log fallback and records `message_prepared` (channel `whatsapp_link`) on the ledger. The action says "prepared, not sent". Numbers are normalised for Indonesia (`0812-3456-7890`, `+62 812…`, `0062…`, `812…` all become `62812…`); an unusable number is skipped with its reason and the message is logged as before. The owner opens the link from their own phone, then taps **Tandai terkirim**: `POST /api/operations/:id/messages/:messageId/sent` records `message_sent_by_owner` (the owner's word, not a delivery receipt) and is idempotent (`changed: false` the second time). Prepared messages are on the operation as `prepared`. Held things stay held: a reminder held because the tenant promised to pay prepares nothing, and a minimarket purchase order above the limit gets its link only after the owner approves it. Minimarket suppliers take a `whatsapp` value too (`{"suppliers": {"A": {"whatsapp": "0812…"}}}`).
 
 ### Any SOP (generic pack) and connectors
 
@@ -254,6 +338,9 @@ packages/anchor   Publishes ledger Merkle roots on a testnet and verifies them
 | Change a rule (Maintain) | Implemented: revisions from a revised SOP or edited cards, a card-level diff, run impact on the same month, superseding on approval, and switching a live run to the new rules. Checked in the browser: Haiku 5.5 read "denda 5%" → "8%" as exactly one change (R3 percent 5 → 8), the revision passed the Auditor, and the impact showed late fees Rp1.275.000 → Rp2.040.000 across 11 rooms. The passkey approval of a revision needs the owner |
 | Any SOP (generic pack) + connectors | Implemented: rule DSL, codegen, engine, Auditor spec + mutants, CSV data, Composio and MCP connectors, generic Operator with passkey-held actions, studio flow. Checked live with Opus and Haiku and in the browser. Composio and MCP are tested with a fake Composio client and a real in-process MCP server. **Composio verified live (19 Oct 2026):** with a Connect consumer key (`ck_…`, via Composio's hosted MCP server), the tool check found GMAIL_SEND_EMAIL ready, and a test email was sent and accepted by Gmail through the broker's path (`npm run connectors:send`). Telegram is wired into the sample but not connected yet. WhatsApp is deferred, because Composio's WhatsApp tools need a WhatsApp Business account. Google Sheets is read via CSV export for now |
 | On-chain anchor | Implemented: the ledger's Merkle root goes on Monad testnet or Base Sepolia as a zero-value self-transaction with `REEVE1` + root + receipt count, and is checked back from the chain. Endpoints `GET /api/anchor`, `POST /api/ledger/anchor`, `GET /api/ledger/anchors/:seq/verify`; `npm run anchor:wallet` and `anchor:now`. **Verified live on Monad testnet (19 Oct 2026):** the root over 23 receipts was anchored in tx `0x6f1938…3c39` (block 72355956), recorded at ledger #44, and read back from the chain (check OK) |
+| Operator: scheduler, messages, payment tools, minimarket, replies (11 Nov 2026) | **Implemented and unit/API tested with mocks and the Log connector only; no real Telegram message, email or bill was sent during development.** Scheduler: tested with a fake clock. Messages: really sent only with a connected Telegram or Gmail account, otherwise logged. Payment tools: mock rail tested; Stripe and Xendit use the same adapters verified live above, but not re-run through the tool path. Minimarket: runs through the generic Operator in tests (messages logged). LLM drafting and reply reading: tested with a fake model, **not yet run against a real model**, off unless `REEVE_OPERATOR_LLM=on`. Telegram webhook: tested with simulated updates, **not yet registered with a real bot** |
+| Cost meter and WhatsApp click-to-send (11 Nov 2026) | **Implemented and unit/API tested with fake providers and fake connectors only; no paid model call, no real message and no WhatsApp message was sent during development.** Token capture is tested against faked Anthropic and OpenAI-compatible replies in the shape their docs describe, **not yet against a live reply**. The per-model prices and the Haiku long-prompt tier are the Claude price table as checked on 11 Nov 2026; the cache multipliers (1.25x write, 0.1x read) are Anthropic's documented ratios and were not part of that check. A prepared WhatsApp message is only a link; "sent by owner" is the owner's word. |
+| Xendit per-merchant sub-accounts (11 Nov 2026) | **Implemented and tested with a fake network only; no real Xendit call was made.** Reeve never holds merchant funds: each owner stores their own xenPlatform sub-account id (`GET/PUT/DELETE /api/rails/xendit/account`, body `{accountId}`), and every Xendit call (create, get, refund, simulate, payout) sends it as `for-user-id`. With no id stored, a Xendit run is refused (409, "Hubungkan akun Xendit Anda dulu…") and no request is sent; `mock` is unaffected. A webhook whose `business_id` is missing or not the operation owner's sub-account gets 403. Disconnecting is refused (409) while Xendit bills are open. Needs `@reeve/rails` with the `RailContext` change (reeve-payments). **Not verified:** that `for-user-id` is accepted on the simulate and payout endpoints (docs do not list it), `/refunds` vs the documented `/v3/refunds`, and the webhook `business_id` field on a real event. **Not built:** creating the sub-account through the xenPlatform accounts API (owner pastes the id for now). Stripe stays test-mode only, not offered to Indonesian merchants (TODO(per-merchant) in `stripe.ts` for Connect) |
 | Mera PRF vault, Midtrans, payouts | Next slices |
 
 > Running from inside Claude Code? Its shell sets `ANTHROPIC_BASE_URL`; run `env -u ANTHROPIC_BASE_URL npm run demo:live` so the SDK talks to api.anthropic.com with your own key.

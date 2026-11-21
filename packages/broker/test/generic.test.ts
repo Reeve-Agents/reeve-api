@@ -9,7 +9,7 @@ const rb = loadFixtureRulebook("bimbel-cerdas");
 const rulesPy = compile(rb).files["rules.py"];
 const constraintsJson = prepareAudit(rb, rulesPy).files["constraints.json"]!;
 
-function setup() {
+function setup(noMessaging = false) {
   const calls: { connector: string; tool: string; args: Record<string, unknown> }[] = [];
   const ledger: { event: string }[] = [];
   const op = newGenericOperation({ id: "op_g", rulebookId: "rb", receiptHash: "r", datasetId: "sample", startDate: "2026-11-02" });
@@ -17,6 +17,7 @@ function setup() {
     runRules: (scenario) => runOperate({ repoRoot, rulesPy, constraintsJson, scenario, sandbox: new LocalSandbox() }),
     execute: async (connector, tool, args) => {
       calls.push({ connector, tool, args });
+      if (noMessaging && connector !== "log") return { ok: false, connector: "none", error: `no connected service has ${tool}` };
       return { ok: true, connector: tool === "GMAIL_SEND_EMAIL" ? "composio" : "log" };
     },
     records: async () => bimbelRecords().records,
@@ -27,6 +28,16 @@ function setup() {
 }
 
 describe("generic Operator", () => {
+  it("keeps a message no connected service can send on the Log connector, and records it as logged", async () => {
+    const { op, operator, calls, ledger } = setup(true);
+    await operator.advance("2026-11-02");
+    const messages = op.sent.filter((s) => /SEND_MESSAGE|SEND_EMAIL/.test(s.tool));
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.every((s) => s.ok && s.via === "log" && /no connected service/.test(s.error ?? ""))).toBe(true);
+    expect(calls.some((c) => c.connector === "log" && c.tool === "LOG" && String(c.args.not_sent_because).includes("no connected service"))).toBe(true);
+    expect(ledger.some((l) => l.event === "message_logged")).toBe(true);
+  });
+
   it("sends the approved rules' tool calls, holds the ones above the limit, never messages a stopped student", async () => {
     const { op, operator, calls } = setup();
     await operator.advance("2026-11-02");
