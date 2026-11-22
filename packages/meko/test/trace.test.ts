@@ -45,6 +45,18 @@ describe("Meko trace", () => {
     expect(meko.usage[0]).toMatchObject({ total_tokens: 6, message_id: d.message_id });
   });
 
+  it("pages through a Cloud conversation with more than 100 messages", async () => {
+    const meko = new FakeMeko(["datapack_search", "track_token_usage"]);
+    meko.requireDatapack = true;
+    const ws = await MekoWorkspace.open(meko, { workspace: "kos-melati", ledger: ledgerAt() });
+    const op = await ws.run("run_big").agent("operator", "Tick");
+    const receipts: string[] = [];
+    for (let i = 0; i < 130; i++) receipts.push((await op.decide({ input: `kamar ${i}`, output: { n: i }, reasoning: "r", action: "remind" })).receipt_hash);
+    const conv = await ws.conversation("operator", op.conversationId);
+    expect(conv.messages).toHaveLength(130);
+    expect((await verifyDecision(ws, receipts[129]!)).ok).toBe(true);
+  });
+
   it("uses MEKO_DATAPACK_ID on Cloud and explains a refused datapack_create", async () => {
     const meko = new FakeMeko(["datapack_search", "track_token_usage"]);
     meko.requireDatapack = true;

@@ -78,7 +78,8 @@ if (args.has("--llm")) {
 
 // 1. The SOP itself: Builder compiles, Auditor runs every planted defect in the sandbox, owner approves.
 const day = "2026-12-01";
-const run = ws.run(`run_kos_${day.replaceAll("-", "")}`);
+// Unique per seed: Meko Cloud keeps conversations for good and dedups on the session id (workspace:agent:run), so a second seed must not reuse the first one's.
+const run = ws.run(`run_kos_${day.replaceAll("-", "")}_${Date.now().toString(36)}`);
 const rulebook = loadFixtureRulebook("kos-melati");
 say("auditing the Kos Melati SOP in the local sandbox ...");
 const attempt = await runAttempt({ repoRoot, rulebook, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `meko-${Date.now().toString(36)}` });

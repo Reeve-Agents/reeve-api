@@ -54,16 +54,26 @@ export async function connectMeko(endpoint: MekoEndpoint = mekoEndpointFromEnv()
   let names: string[] | undefined;
   return {
     async call(tool, args) {
-      const res = await client.callTool({ name: tool, arguments: args });
-      const text = (res.content as { type: string; text?: string }[])
-        .filter((c) => c.type === "text")
-        .map((c) => c.text ?? "")
-        .join("\n");
-      if (res.isError) throw new MekoError(tool, text);
-      try {
-        return JSON.parse(text);
-      } catch {
-        return text;
+      // Meko Cloud is eventually consistent: a conversation made a moment ago can still be "not found". Retry that
+      // (nothing was stored when it fails) a few times before giving up.
+      for (let attempt = 0; ; attempt++) {
+        const res = await client.callTool({ name: tool, arguments: endpoint.cloud ? cloudArgs(args) : args });
+        const text = (res.content as { type: string; text?: string }[])
+          .filter((c) => c.type === "text")
+          .map((c) => c.text ?? "")
+          .join("\n");
+        if (res.isError) throw new MekoError(tool, text);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          return text;
+        }
+        if (endpoint.cloud && attempt < 6 && retryable(parsed)) {
+          await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+          continue;
+        }
+        return endpoint.cloud ? cloudResult(parsed) : parsed;
       }
     },
     async tools() {
@@ -72,4 +82,44 @@ export async function connectMeko(endpoint: MekoEndpoint = mekoEndpointFromEnv()
     },
     close: () => client.close(),
   };
+}
+
+/** Meko Cloud declares `metadata` as a JSON string (local Meko takes an object), so send it as one. */
+export function cloudArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const m = args.metadata;
+  return m && typeof m === "object" ? { ...args, metadata: JSON.stringify(m) } : args;
+}
+
+/** ...and it may hand `metadata` back as a JSON string: parse it so callers see the same shape as on local Meko. */
+export function cloudResult(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(cloudResult);
+  if (!v || typeof v !== "object") return v;
+  const out: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v)) {
+    if (k === "metadata" && typeof x === "string" && x.startsWith("{")) {
+      try {
+        out[k] = JSON.parse(x);
+        continue;
+      } catch {
+        /* keep the string */
+      }
+    }
+    // Cloud stores a message's plan (a list) as a JSON string; hand it back as the list Reeve sent.
+    if (k === "plan" && typeof x === "string" && x.startsWith("[")) {
+      try {
+        out[k] = JSON.parse(x);
+        continue;
+      } catch {
+        /* keep the string */
+      }
+    }
+    // Cloud may return a message's JSON text fields already parsed; local Meko keeps the exact string Reeve sent.
+    out[k] = (k === "output" || k === "input" || k === "reasoning") && x && typeof x === "object" ? JSON.stringify(x) : cloudResult(x);
+  }
+  return out;
+}
+
+/** Cloud answers a too-early read with {"error":"not_found"}; only that is worth another try. */
+export function retryable(v: unknown): boolean {
+  return !!v && typeof v === "object" && (v as { error?: unknown }).error === "not_found";
 }

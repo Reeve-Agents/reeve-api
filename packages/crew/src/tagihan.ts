@@ -41,9 +41,12 @@ function daysLate(due: string, today: string): number {
   return Math.round((Date.parse(today) - Date.parse(due)) / 86_400_000);
 }
 
-/** An owner exception in memory: "Kamar 3 boleh telat sampai 10 hari". */
+/**
+ * An owner exception in memory: "Kamar 3 boleh telat sampai 10 hari". Only the owner's wording counts ("boleh telat"):
+ * Meko Cloud also distils facts from the Operator's own traces ("kamar 5 ... telat 10 hari"), and those are not permission.
+ */
 export function exceptionDays(text: string, room: string): number | null {
-  const m = text.match(new RegExp(`kamar ${room}\\b[^.]*?telat (?:sampai |hingga )?(\\d+) hari`, "i"));
+  const m = text.match(new RegExp(`kamar ${room}\\b[^.]*?boleh telat (?:sampai |hingga )?(\\d+) hari`, "i"));
   return m ? Number(m[1]) : null;
 }
 

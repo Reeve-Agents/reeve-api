@@ -177,13 +177,20 @@ export class MekoWorkspace {
   }
 
   async conversation(agent: string, conversationId: string): Promise<MekoConversation> {
-    const got = (await this.transport.call("conversation_get", {
-      datapack_id: this.datapackId,
-      conversation_id: conversationId,
-      agent_id: agent,
-      include_messages: true,
-    })) as MekoConversation;
-    return { ...got, messages: got.messages ?? [] };
+    const get = async (extra: Record<string, unknown>) =>
+      (await this.transport.call("conversation_get", { datapack_id: this.datapackId, conversation_id: conversationId, agent_id: agent, include_messages: true, ...extra })) as MekoConversation;
+    const got = await get({});
+    let messages = got.messages ?? [];
+    // Meko Cloud returns at most 100 messages per call (limit/offset); a busy Operator conversation has more.
+    if ((await this.transport.tools()).includes("track_token_usage")) {
+      const page = 100;
+      for (let offset = page; messages.length === offset && offset < 5000; offset += page) {
+        const more = (await get({ limit: page, offset })).messages ?? [];
+        messages = [...messages, ...more];
+        if (more.length < page) break;
+      }
+    }
+    return { ...got, messages };
   }
 }
 
@@ -261,7 +268,13 @@ export class AgentTrace {
     };
     // Promoted (collective) memories come back as knowledge-base chunks with source "memory" and
     // without their metadata, so callers must read facts from the text, not from metadata.
-    const kb = res.results?.knowledge_base ?? [];
+    let kb = res.results?.knowledge_base ?? [];
+    // Meko Cloud's context_search sometimes skips the knowledge-base source ("some sources failed or were not searched")
+    // and then misses promoted owner exceptions, so ask the knowledge base directly when it came back empty.
+    if (kb.length === 0 && (await this.run.ws.transport.tools()).includes("knowledgebase_search") && (await this.run.ws.transport.tools()).includes("track_token_usage")) {
+      const direct = (await this.run.ws.transport.call("knowledgebase_search", { ...this.base(), query: this.clean(query), limit })) as { results?: Record<string, unknown>[] };
+      kb = direct.results ?? [];
+    }
     const filters = (k: Record<string, unknown>) => (k.metadata_filters ?? {}) as Record<string, unknown>;
     const lookup: Lookup = {
       query: this.clean(query),
@@ -297,7 +310,31 @@ export class AgentTrace {
     const id = res.results?.[0]?.id ?? str(res, "id");
     if (!opts.promote) return { id };
     const p = (await this.run.ws.transport.call("memory_promote", { ...this.base(), memory_ids: [id] })) as { inserted_ids?: string[] };
+    await this.waitUntilShared(text);
     return { id, promoted: p.inserted_ids?.[0] };
+  }
+
+  /**
+   * On Meko Cloud a promoted memory reaches the knowledge base a little later (local Meko: at once). An Operator
+   * that checks for an owner exception right after the owner granted it would miss it and charge a fee, so wait
+   * until a search finds it (best effort, bounded; `sharedDelayMs` is how long it took, -1 if it never showed).
+   */
+  sharedDelayMs?: number;
+  private async waitUntilShared(text: string, maxMs = Number(process.env.REEVE_MEKO_SHARED_WAIT_MS ?? 120_000)): Promise<void> {
+    const ws = this.run.ws;
+    const tools = await ws.transport.tools();
+    if (!tools.includes("track_token_usage") || !tools.includes("knowledgebase_search")) return;
+    const needle = this.clean(text).slice(0, 40).toLowerCase();
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      const res = await ws.transport.call("knowledgebase_search", { ...this.base(), query: this.clean(text).slice(0, 200), limit: 10 });
+      if (JSON.stringify(res).toLowerCase().includes(needle.replace(/"/g, '\\"'))) {
+        this.sharedDelayMs = Date.now() - t0;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+    this.sharedDelayMs = -1;
   }
 
   /** Stores JSON as a Meko artifact; Meko addresses it by SHA-256 (`content_hash`). */

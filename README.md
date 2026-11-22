@@ -77,6 +77,16 @@ npm run crew:demo -- --fresh
 
 Meko Cloud: `npm run meko:seed` (needs `MEKO_API_KEY`; `--local` rehearses on local Meko; `--ledger=pg` writes the ledger where the deployed API reads it).
 
+Where Meko Cloud differs from local Meko (all handled in `packages/meko`, checked on 23 Nov 2026 with a real seed: 113 traced decisions, 113 verified):
+- **Datapack.** A conversation needs a `datapack_id`, and a new account has none. Reeve searches by name (`datapack_search`, any non-empty `conversation_id` works as bootstrap), then tries `datapack_create`. If Cloud refuses (it did: `INTERNAL_ERROR`), create a datapack in the Meko app and set `MEKO_DATAPACK_ID` (or `MEKO_DATAPACK_ID_<WORKSPACE>`).
+- **Metadata and plan** go over as JSON strings and come back as strings; Reeve converts them so the receipt hash still matches.
+- **Messages** come 100 per call (`limit`/`offset`); Reeve pages.
+- **Reads can lag** (`not_found` just after a write): retried up to 6 times.
+- **Promoted memories** are in the knowledge base, but `context_search` sometimes skips that source; Reeve asks `knowledgebase_search` when it comes back empty, and waits for a new owner exception to be searchable before the Operator acts on it.
+- **Cloud distils facts from traces** ("K05 is 10 days late") into memories. An owner exception now counts only in the owner's wording ("boleh telat"), so a distilled fact can never become a permission.
+- **Conversations are permanent and deduplicated by session id**, so every seed gets a fresh run id. `--fresh` cannot wipe a Cloud datapack.
+- `track_token_usage` works (`recorded: true`); `datapack_metrics` does not exist on Cloud.
+
 ```bash
 npm run dev
 ```

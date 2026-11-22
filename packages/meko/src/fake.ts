@@ -89,7 +89,7 @@ export class FakeMeko implements MekoTransport {
       case "conversation_get": {
         const c = this.conv(args, tool);
         if (args.agent_id !== c.agent_id) throw new MekoError(tool, "conversation_not_found");
-        return { id: c.id, agent_id: c.agent_id, run_id: c.run_id ?? null, title: c.title, metadata: c.metadata, message_count: c.messages.length, messages: args.include_messages ? structuredClone(c.messages) : undefined };
+        return { id: c.id, agent_id: c.agent_id, run_id: c.run_id ?? null, title: c.title, metadata: c.metadata, message_count: c.messages.length, messages: args.include_messages ? structuredClone(this.requireDatapack ? c.messages.slice(Number(args.offset ?? 0), Number(args.offset ?? 0) + Number(args.limit ?? 100)) : c.messages) : undefined };
       }
       case "memory_add": {
         const m: Mem = { id: randomUUID(), memory: String(args.text), hash: createHash("md5").update(String(args.text)).digest("hex"), datapack_id: args.datapack_id as string, agent_id: String(args.agent_id), promoted: false, metadata: (args.metadata as Record<string, unknown>) ?? {} };
