@@ -11,10 +11,11 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, storeRapor,
+  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
   type ExecResult, type TenantBill, type WorkerFn,
 } from "@reeve/crew";
+import { filePersistence } from "../../api/src/persistence";
 import { AnthropicProvider } from "@reeve/llm";
 import { connectMeko, mekoEndpointFromEnv, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import { kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, repoRoot, runAttempt } from "@reeve/pipeline";
@@ -47,7 +48,9 @@ if (args.has("--fresh")) {
   say("fresh: demo datapack and ledger removed");
 }
 mkdirSync(dir, { recursive: true });
-const ledger = persistence ? (await persistence.openWorkspace(`meko-${WS}`)).ledger : new Ledger(join(dir, "ledger.jsonl"));
+// The store holds what the owner web UI reads: the review queue and the autonomy ladder.
+const opened = await (persistence ?? filePersistence(home)).openWorkspace(`meko-${WS}`);
+const ledger = opened.ledger;
 say(`ledger: ${persistence ? `Postgres workspace meko-${WS}` : join(dir, "ledger.jsonl")} (${ledger.entries().length} entries before)`);
 const ws = await MekoWorkspace.open(meko, { workspace: WS, ledger, pseudonyms: new Pseudonymiser() });
 say(`datapack ${MekoWorkspace.datapackName(WS)} = ${ws.datapackId}`);
@@ -111,6 +114,10 @@ const bills: TenantBill[] = [
   { id: "K17", room: "17", due: day, paid: false, tenure_months: 2 },
 ];
 const ladder = new Ladder(ws);
+// Earlier in the month 18 more reminders went out by themselves without a complaint: with the ones
+// below, "Pengingat bayar" has the 20 clean receipts that let Reeve ask the owner to move it up.
+const earlier: TenantBill[] = Array.from({ length: 18 }, (_, i) => ({ id: `K${20 + i}`, room: String(20 + i), due: "2026-11-01", paid: false, tenure_months: 6 }));
+await rentTick(run, earlier, "2026-11-04", { execute: (tool, a) => execute("log", tool, a), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
 for (const today of ["2026-12-04", "2026-12-08", "2026-12-11"]) {
   const out = await rentTick(run, bills, today, { execute: (tool, a) => execute("log", tool, a), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
   say(`tick ${today}: ${out.filter((o) => o.action !== "none").map((o) => `${o.id} ${o.action}`).join(", ")}`);
@@ -145,6 +152,7 @@ const approvalSeq = ws.decisions().find((d) => d.entry_hash === b.state.approved
 say(`autonomy from the approval: ${ladder.grantFromPlaybook(b.state.playbook, approvalSeq).join(", ")} -> ask_if_unusual`);
 const listing = await b.roomVacant("7", "3 Desember 2026");
 await b.reviewListing(listing.id, { approve: true });
+for (const [room, from] of [["9", "10 Desember 2026"], ["11", "12 Desember 2026"]] as const) await b.roomVacant(room, from); // their drafts wait in the owner's review queue
 await b.prospectMessage("p1", "Rina Kartika", "7", "Halo kak, harga sewa kamar 7 berapa per bulan?");
 await b.prospectMessage("p1", "Rina Kartika", "7", "Fasilitasnya apa aja? ada wifi?");
 await b.prospectMessage("p1", "Rina Kartika", "7", "Bisa nego jadi 1,3 juta?");
@@ -181,6 +189,12 @@ for (let i = 0; i < 6 && c.state.status === "running"; i++) {
   });
   say(`discovery: ${st.candidates.length} candidates, replay ${st.replay.agree}/${st.replay.bills}, mode ${res.mode}, audit ${res.audit?.killed}/${res.audit?.total}`);
 }
+
+// 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder.
+saveReview(opened.store.data, [...b.state.queue, ...c.state.queue]);
+saveLadderState(opened.store.data, ladder.state);
+opened.store.save();
+say(`owner state: ${b.state.queue.length + c.state.queue.length} review items (${[...b.state.queue, ...c.state.queue].filter((q) => q.status === "pending").length} pending), ladder ${JSON.stringify(Object.fromEntries(Object.entries(ladder.state.levels).map(([k, v]) => [k, v.level])))}`);
 
 // 7. Anchor the ledger (local; `npm run anchor:now` publishes the root on Monad testnet).
 const leaves = anchorLeaves(ledger.entries());

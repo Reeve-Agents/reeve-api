@@ -76,6 +76,7 @@ const mekoOwner = createMekoOwnerApp(
     template: () => loadFixtureRulebook(),
     telegram: mekoTg,
     webOrigin: origin,
+    store: mekoStore.store,
   },
   mekoOpen,
 );
