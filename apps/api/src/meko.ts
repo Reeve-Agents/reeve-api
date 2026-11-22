@@ -105,6 +105,8 @@ export interface MekoOwnerDeps {
   audit?: (rb: Rulebook) => Promise<DiscoveryAudit>;
   /** The template SOP offered in "mode belajar". */
   template?: () => Rulebook;
+  /** Telegram tenant links and the wa.me fallback (meko-telegram.ts). */
+  telegram?: { createLink(subject: string): unknown; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
 }
 
 /**
@@ -152,6 +154,18 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     const st = states.get(c.req.param("id"));
     if (!st) return c.json({ error: "Sesi discovery tidak ditemukan." }, 404);
     return c.json(await (await discovery()).finish(st, deps.audit, deps.template));
+  });
+
+  // "Kenapa saya didenda?": a Telegram link code for one tenant, or the answer as a wa.me link.
+  app.post("/telegram/link", async (c) => {
+    if (!deps.telegram) return c.json({ error: "Telegram belum diatur di server ini (TELEGRAM_WEBHOOK_SECRET)." }, 409);
+    const { subject } = (await c.req.json().catch(() => ({}))) as { subject?: string };
+    return c.json(deps.telegram.createLink(String(subject ?? "").toUpperCase()));
+  });
+  app.post("/explain/whatsapp", async (c) => {
+    if (!deps.telegram) return c.json({ error: "Belum diatur." }, 409);
+    const { subject, question } = (await c.req.json().catch(() => ({}))) as { subject?: string; question?: string };
+    return c.json(await deps.telegram.explainForWhatsApp(String(subject ?? "").toUpperCase(), String(question ?? "").slice(0, 300)));
   });
 
   return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }) };

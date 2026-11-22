@@ -10,6 +10,7 @@ import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
 import { createMekoApp, createMekoOwnerApp, mekoOpener } from "./meko";
+import { mekoTelegram } from "./meko-telegram";
 import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
 import { schedulerFromEnv } from "./scheduler";
 import { filePersistence } from "./persistence";
@@ -51,15 +52,18 @@ const scheduler = schedulerFromEnv();
 // Local Meko by default; Meko Cloud with MEKO_API_KEY. Seed it with `npm run crew:demo`.
 const mekoWorkspace = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
 const mekoEndpoint = mekoEndpointFromEnv();
+const mekoStore = await persistence.openWorkspace(`meko-${mekoWorkspace}`);
 const mekoDeps = {
   workspace: mekoWorkspace,
-  ledger: (await persistence.openWorkspace(`meko-${mekoWorkspace}`)).ledger,
+  ledger: mekoStore.ledger,
   connect: () => connectMeko(mekoEndpoint),
   endpoint: mekoEndpoint,
   allowAsk: process.env.REEVE_MEKO_PUBLIC_ASK === "on",
 };
 const mekoOpen = mekoOpener(mekoDeps);
 const mekoApp = createMekoApp(mekoDeps, mekoOpen);
+// Tenants ask "kenapa saya didenda?" on Telegram (same bot webhook and secret as the workspaces).
+const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined });
 // Owner actions on that workspace (SOP Discovery), behind the session at /api/meko/owner/*.
 const mekoOwner = createMekoOwnerApp(
   {
@@ -69,6 +73,7 @@ const mekoOwner = createMekoOwnerApp(
       return { status: a.verdict.status, cases: a.plan.cases.length, killed: mut?.killed ?? 0, total: mut?.total ?? 0 };
     },
     template: () => loadFixtureRulebook(),
+    telegram: mekoTg,
   },
   mekoOpen,
 );
@@ -76,6 +81,7 @@ const mekoOwner = createMekoOwnerApp(
 const { app, openAll } = await createAccountsApp({
   persistence,
   publicApps: [{ prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) }],
+  webhookFirst: (req) => (new URL(req.url).pathname === "/api/webhooks/telegram" ? mekoTg.handle(req) : Promise.resolve(null)),
   ownerApps: [{ prefix: "/api/meko/owner/", fetch: (req, account) => mekoOwner.fetch(req, account) }],
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
