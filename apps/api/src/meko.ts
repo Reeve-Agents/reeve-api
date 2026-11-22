@@ -1,7 +1,8 @@
 // Public, read-only view of one Meko-traced demo workspace (Kos Melati): decisions, "explain this
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
-import { AskBusiness, buildRapor, raporHtml } from "@reeve/crew";
+import type { Rulebook } from "@reeve/core";
+import { AskBusiness, buildRapor, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, paymentsFromRows, parsePaymentsCsv, raporHtml, SopDiscovery } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -17,14 +18,18 @@ export interface MekoAppDeps {
   explainUrl?: (receipt: string) => string;
 }
 
-export function createMekoApp(deps: MekoAppDeps) {
-  const app = new Hono().basePath("/api/meko/public");
+/** One workspace connection shared by the public and the owner app; retried after a failure. */
+export function mekoOpener(deps: Pick<MekoAppDeps, "workspace" | "ledger" | "connect">): () => Promise<MekoWorkspace> {
   let ws: Promise<MekoWorkspace> | null = null;
-  const open = () => {
+  return () => {
     ws ??= deps.connect().then((t) => MekoWorkspace.open(t, { workspace: deps.workspace, ledger: deps.ledger, pseudonyms: new Pseudonymiser() }));
     ws.catch(() => (ws = null));
     return ws;
   };
+}
+
+export function createMekoApp(deps: MekoAppDeps, open = mekoOpener(deps)) {
+  const app = new Hono().basePath("/api/meko/public");
   const explainUrl = deps.explainUrl ?? ((r: string) => `/?view=jejak&receipt=${r}`);
 
   app.onError((err, c) => c.json({ error: `Meko belum bisa dihubungi: ${err.message.slice(0, 200)}` }, 503));
@@ -93,4 +98,61 @@ export function createMekoApp(deps: MekoAppDeps) {
   });
 
   return app;
+}
+
+export interface MekoOwnerDeps {
+  /** Runs the normal pipeline audit (spec cases and planted defects) on a discovered rulebook. */
+  audit?: (rb: Rulebook) => Promise<DiscoveryAudit>;
+  /** The template SOP offered in "mode belajar". */
+  template?: () => Rulebook;
+}
+
+/**
+ * Owner actions on the Meko workspace, behind the session (/api/meko/owner/*): SOP Discovery.
+ * Called as `fetch(req, { account })`.
+ */
+export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<MekoWorkspace>) {
+  const app = new Hono<{ Bindings: { account: string } }>().basePath("/api/meko/owner");
+  let disc: SopDiscovery | null = null;
+  const discovery = async () => (disc ??= new SopDiscovery(await open()));
+  const states = new Map<string, DiscoveryState>();
+  const keep = (st: DiscoveryState) => {
+    states.set(st.id, st);
+    while (states.size > 50) states.delete(states.keys().next().value!);
+  };
+
+  app.onError((err, c) => c.json({ error: err.message.slice(0, 300) }, /tidak|kosong|sudah|Tulis|Chat|Data/.test(err.message) ? 400 : 503));
+
+  app.get("/discovery/sample", (c) => c.json({ business: "Kos Melati", ...kosDiscoverySample() }));
+
+  app.post("/discovery", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { chat?: string; payments_csv?: string; payments_rows?: Record<string, unknown>[]; business?: string };
+    if (typeof body.chat !== "string" || body.chat.length > 3_000_000) return c.json({ error: "Kirim isi chat WhatsApp (.txt, maks. 3 MB)." }, 400);
+    const payments = Array.isArray(body.payments_rows) ? paymentsFromRows(body.payments_rows.slice(0, 20_000)) : typeof body.payments_csv === "string" ? parsePaymentsCsv(body.payments_csv.slice(0, 3_000_000)) : [];
+    const st = await (await discovery()).start({ chat: body.chat, payments, business: body.business?.slice(0, 80) || undefined });
+    keep(st);
+    return c.json(st);
+  });
+
+  app.get("/discovery/:id", (c) => {
+    const st = states.get(c.req.param("id"));
+    return st ? c.json(st) : c.json({ error: "Sesi discovery tidak ditemukan (server mungkin baru dimulai ulang)." }, 404);
+  });
+
+  app.post("/discovery/:id/answer", async (c) => {
+    const st = states.get(c.req.param("id"));
+    if (!st) return c.json({ error: "Sesi discovery tidak ditemukan." }, 404);
+    const body = (await c.req.json().catch(() => ({}))) as { candidate?: string; yes?: boolean };
+    if (typeof body.candidate !== "string" || typeof body.yes !== "boolean") return c.json({ error: "Kirim candidate dan yes (true/false)." }, 400);
+    const receipt = await (await discovery()).answer(st, body.candidate, body.yes, `account ${c.env?.account ?? "?"}`);
+    return c.json({ receipt, answers: st.answers });
+  });
+
+  app.post("/discovery/:id/finish", async (c) => {
+    const st = states.get(c.req.param("id"));
+    if (!st) return c.json({ error: "Sesi discovery tidak ditemukan." }, 404);
+    return c.json(await (await discovery()).finish(st, deps.audit, deps.template));
+  });
+
+  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }) };
 }

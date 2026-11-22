@@ -10,3 +10,5 @@ export * from "./tagihan";
 export * from "./cicilan";
 export * from "./ask";
 export * from "./rapor";
+export * from "./discovery";
+export * from "./discovery-sample";

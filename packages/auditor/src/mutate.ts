@@ -144,7 +144,10 @@ export function generateMutants(rulesPy: string): Mutant[] {
     add("policy", `suppliers swapped (${def} ↔ ${bak})`, replaceConstant(replaceConstant(rulesPy, "DEFAULT_SUPPLIER", bak), "BACKUP_SUPPLIER", def));
   }
 
+  // No revenue target: the KPI check is dead code, so its defects would all be equivalent mutants.
+  const kpiLive = constantValue(rulesPy, "REVENUE_TARGET") !== "None";
   for (const [name, [a, b]] of Object.entries(SWAPS)) {
+    if (name === "REVENUE_BASIS" && !kpiLive) continue;
     const v = constantValue(rulesPy, name);
     if (v === a) add("policy", `${name} ${a} → ${b}`, replaceConstant(rulesPy, name, b));
     else if (v === b) add("policy", `${name} ${b} → ${a}`, replaceConstant(rulesPy, name, a));
@@ -161,6 +164,7 @@ export function generateMutants(rulesPy: string): Mutant[] {
   // Structural defects in every rule function. Under a credit policy the refund branch of
   // handle_overpayment is dead code, so planting defects there would only add equivalent mutants.
   const structural = generateStructuralMutants(rulesPy, {
+    ...(kpiLive ? {} : { skipFunctions: ["kpi_check_today", "kpi_alert"] }),
     skipLine: (fn, line, body) => {
       if (fn !== "handle_overpayment" || refundLive) return false;
       const creditReturn = body.findIndex((l) => l.includes('return ("credit"'));

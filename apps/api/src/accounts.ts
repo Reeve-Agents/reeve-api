@@ -54,6 +54,8 @@ export interface AccountDeps {
   supabase?: { url: string; key: string } | null;
   /** Read-only public apps served without a session, by path prefix (the Meko demo workspace). */
   publicApps?: { prefix: string; fetch: (req: Request) => Response | Promise<Response> }[];
+  /** Apps outside the workspace that still need a signed-in owner, by path prefix (Meko owner actions). */
+  ownerApps?: { prefix: string; fetch: (req: Request, account: string) => Response | Promise<Response> }[];
 }
 
 const COOKIE = "reeve_session";
@@ -289,6 +291,8 @@ export async function createAccountsApp(deps: AccountDeps) {
       if (c.req.path === "/api/health") return c.json({ ...deps.publicHealth(), signedIn: false });
       return c.json({ error: "Masuk dulu untuk memakai Reeve." }, 401);
     }
+    const own = deps.ownerApps?.find((p) => c.req.path.startsWith(p.prefix));
+    if (own) return own.fetch(c.req.raw, account.id);
     return (await workspace(account)).fetch(c.req.raw);
   });
 

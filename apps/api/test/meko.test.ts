@@ -5,7 +5,7 @@ import { rentTick } from "@reeve/crew";
 import { FakeMeko, MekoWorkspace } from "@reeve/meko";
 import { Ledger } from "@reeve/receipts";
 import { describe, expect, it } from "vitest";
-import { createMekoApp } from "../src/meko";
+import { createMekoApp, createMekoOwnerApp, mekoOpener } from "../src/meko";
 
 async function setup(allowAsk = false) {
   const meko = new FakeMeko();
@@ -63,5 +63,26 @@ describe("public Meko view", () => {
     const open = await setup(true);
     const res = await open.app.request("/api/meko/public/ask", { method: "POST", body: JSON.stringify({ question: "Kenapa saya didenda?", role: "tenant", subject: "K05" }) });
     expect(((await res.json()) as { text: string }).text).toContain("Rp75.000");
+  });
+});
+
+describe("owner SOP Discovery API", () => {
+  it("mines the sample, records each tap and finishes in mode belajar below 3 rules", async () => {
+    const meko = new FakeMeko();
+    const ledger = new Ledger(join(mkdtempSync(join(tmpdir(), "meko-owner-")), "ledger.jsonl"));
+    const owner = createMekoOwnerApp({ audit: async () => ({ status: "pass", cases: 10, killed: 5, total: 5 }) }, mekoOpener({ workspace: "kos-melati", ledger, connect: async () => meko }));
+    const call = (p: string, body?: unknown) => owner.fetch(new Request(`http://x/api/meko/owner${p}`, body ? { method: "POST", body: JSON.stringify(body) } : {}), "acc1");
+    const sample = (await (await call("/discovery/sample")).json()) as { chat: string; payments: string };
+    expect(sample.chat).toContain("Bu Ratna Melati");
+    const st = (await (await call("/discovery", { chat: sample.chat, payments_csv: sample.payments, business: "Kos Melati" })).json()) as { id: string; candidates: { id: string; cites: { text: string }[] }[] };
+    expect(st.candidates).toHaveLength(9);
+    expect(JSON.stringify(st)).not.toContain("Ratna");
+    const a = (await (await call(`/discovery/${st.id}/answer`, { candidate: "R1", yes: true })).json()) as { receipt: string };
+    expect(a.receipt).toMatch(/^[0-9a-f]{64}$/);
+    expect((await call(`/discovery/${st.id}/answer`, { candidate: "R1" })).status).toBe(400);
+    const res = (await (await call(`/discovery/${st.id}/finish`, {})).json()) as { mode: string };
+    expect(res.mode).toBe("belajar");
+    expect((await call("/discovery/nope")).status).toBe(404);
+    expect((await call("/discovery", { chat: "bukan chat", payments_csv: "" })).status).toBe(400);
   });
 });
