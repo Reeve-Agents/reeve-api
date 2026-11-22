@@ -7,10 +7,12 @@
 //   npm run crew:demo                   # local Meko, templates only (no LLM cost)
 //   npm run crew:demo -- --llm          # Worker on Claude Haiku 5.5 (needs ANTHROPIC_API_KEY)
 //   npm run crew:demo -- --fresh        # drop the demo datapack and ledger first
+//   npm run crew:demo -- --ledger=pg    # ledger in Postgres (DATABASE_URL), as the deployed API reads it
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, storeRapor,
+  kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
   type ExecResult, type TenantBill, type WorkerFn,
 } from "@reeve/crew";
 import { AnthropicProvider } from "@reeve/llm";
@@ -31,6 +33,12 @@ const endpoint = mekoEndpointFromEnv();
 const meko = await connectMeko(endpoint);
 say(`Meko: ${endpoint.cloud ? "Cloud" : "local"} (${endpoint.url})`);
 
+// The deployed API reads the demo ledger from Postgres; a seed for it must write there too.
+const pgLedger = args.has("--ledger=pg");
+const persistence = pgLedger ? await (await import("../../api/src/pg")).openPostgres(process.env.DATABASE_URL ?? "") : null;
+if (pgLedger && !process.env.DATABASE_URL) throw new Error("--ledger=pg needs DATABASE_URL");
+
+if (args.has("--fresh") && persistence) throw new Error("--fresh never deletes a Postgres ledger: use a new REEVE_MEKO_WORKSPACE name instead");
 if (args.has("--fresh")) {
   const setup = (await meko.call("conversation_create", { agent_id: "reeve", title: "Reeve reset" })) as { id: string };
   const packs = (await meko.call("datapack_list", { conversation_id: setup.id, limit: 200 })) as { datapack_id: string; datapack_name: string }[];
@@ -39,7 +47,8 @@ if (args.has("--fresh")) {
   say("fresh: demo datapack and ledger removed");
 }
 mkdirSync(dir, { recursive: true });
-const ledger = new Ledger(join(dir, "ledger.jsonl"));
+const ledger = persistence ? (await persistence.openWorkspace(`meko-${WS}`)).ledger : new Ledger(join(dir, "ledger.jsonl"));
+say(`ledger: ${persistence ? `Postgres workspace meko-${WS}` : join(dir, "ledger.jsonl")} (${ledger.entries().length} entries before)`);
 const ws = await MekoWorkspace.open(meko, { workspace: WS, ledger, pseudonyms: new Pseudonymiser() });
 say(`datapack ${MekoWorkspace.datapackName(WS)} = ${ws.datapackId}`);
 
@@ -159,6 +168,20 @@ for (let i = 0; i < 6 && c.state.status === "running"; i++) {
   cday += 86_400_000;
 }
 
+// 6b. SOP Discovery: rules mined from a (synthetic) WhatsApp export and payments sheet, every owner
+// tap traced, the confirmed rules audited with the planted defects. R8 is declined on purpose.
+{
+  const sample = kosDiscoverySample();
+  const disc = new SopDiscovery(ws);
+  const st = await disc.start({ chat: sample.chat, payments: parsePaymentsCsv(sample.payments), business: "Kos Melati" });
+  for (const c of st.candidates) await disc.answer(st, c.id, c.id !== "R8", "demo seed");
+  const res = await disc.finish(st, async (rb) => {
+    const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `discovery-${Date.now().toString(36)}` });
+    return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
+  });
+  say(`discovery: ${st.candidates.length} candidates, replay ${st.replay.agree}/${st.replay.bills}, mode ${res.mode}, audit ${res.audit?.killed}/${res.audit?.total}`);
+}
+
 // 7. Anchor the ledger (local; `npm run anchor:now` publishes the root on Monad testnet).
 const leaves = anchorLeaves(ledger.entries());
 ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: merkleRoot(leaves), leaves: leaves.length, anchor: "local-ledger" });
@@ -177,3 +200,4 @@ say(`rapor artifact ${stored.content_hash.slice(0, 16)}… -> ${join(dir, "rapor
 if (metrics?.context_efficiency) say(`context_search: ${metrics.searches} searches, ${metrics.context_efficiency.tokens_sent} tokens sent, ${metrics.context_efficiency.tokens_saved} saved (${metrics.context_efficiency.saved_pct}%)`);
 say(`LLM tokens: ${rapor.tokens.llm_input} in / ${rapor.tokens.llm_output} out over ${rapor.tokens.worker_calls} Worker calls`);
 await meko.close();
+await persistence?.close();
