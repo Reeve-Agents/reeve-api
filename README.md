@@ -49,6 +49,19 @@ flowchart LR
 - **Tanya usaha**: a read-only agent that answers "kenapa saya didenda?" from the trace, with a link to the proof.
 - **One payment-plan bound**: "maksimal 2 cicilan, lunas sebelum tanggal 25", audited with planted bad offers; offers inside it cite it, the rest go to the owner.
 - **Rapor Usaha**: the audit report generated from traces and receipts, stored in Meko as an artifact.
+- **SOP Discovery** (`?view=temukan`, signed in):
+  - Input: a WhatsApp chat export and the payments sheet (CSV or Excel). Names become `K01`… first.
+  - Code mines rulebook cards. Each card has a confidence and the chat or payment line it came from. No LLM sees the history.
+  - The Auditor replays every past bill against the cards and shows where they differ from what the owner did.
+  - The owner taps Ya/Tidak on each card. Each tap is a trace plus a receipt.
+  - Confirmed cards go through the normal audit with planted defects. Fewer than 3 confirmed keeps Reeve in "mode belajar": it watches and suggests only.
+- **Telegram tenants**:
+  - A one-time code links a tenant's chat. Only an HMAC of the chat id is kept.
+  - "Kenapa saya didenda?" is answered from the trace with a "lihat bukti" link. The answer is a traced decision too.
+  - WhatsApp stays a `wa.me` link the owner sends by hand.
+- **Rapor share links** (`?view=rapor&share=`):
+  - Metrics only. Revocable; whether a link is live is read from the ledger.
+  - The page recomputes every ledger hash and anchor Merkle root in the browser.
 
 ### Run it
 
@@ -61,6 +74,8 @@ meko start
 ```bash
 npm run crew:demo -- --fresh
 ```
+
+Meko Cloud: `npm run meko:seed` (needs `MEKO_API_KEY`; `--local` rehearses on local Meko; `--ledger=pg` writes the ledger where the deployed API reads it).
 
 ```bash
 npm run dev
