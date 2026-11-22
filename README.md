@@ -122,6 +122,31 @@ What it does not prove. One new business, one SOP, one model, N = 12 per arm, 24
 
 `npm run gotong:demo -- --fake` runs on in-memory Meko; `--runs=N` sets runs per arm; `--llm` uses Haiku (needs `ANTHROPIC_API_KEY`; refuses more than 30 LLM calls and stops if one run costs over US$0.05). Results go to `.reeve/gotong/results-*.json`.
 
+### Token efficiency: code decides vs LLM in the loop (`npm run bench:tokens`)
+
+The same Kos Melati months run two ways. Both arms get the same 49 decision events (the 36 bills of `kosDiscoverySample()`, each checked on H+3, H+7, H+10 and H+14 while still unpaid, or on the day paid when that is before H+3). Ground truth is what the approved rule cards decide (`decideRent`, the logic of `rentTick`, incl. the 12-month grace, once-per-bill fee and the planted exception: K03 in September has the owner's permission to be late, so its fee is held). Mix: 28 none, 13 remind, 5 charge_fee Rp75.000, 2 hold, 1 notice.
+
+- **LLM in the loop.** Per event one call: the full SOP, the whole pseudonymised chat and payments history up to that day, and the bill; strict JSON back (`remind | charge_fee + amount | hold | escalate | none`) plus the message to send.
+- **Reeve.** The SOP is compiled once by the Builder (Haiku). Each decision is made by `rentTick` (code, with a Meko `context_search` for the owner's exceptions). The model only words the message for remind, fee and notice, from the facts plus the 3 best Meko chunks (the `Worker` prompt of `packages/crew`).
+
+Claude Haiku 5.5, local Meko, 10 runs per arm, interleaved, 22 Nov 2026. Per run, mean / median / min / max:
+
+| arm | LLM calls | input tok | output tok | cost (USD) | accuracy vs rules |
+|---|---|---|---|---|---|
+| LLM in the loop | 49 | 105,407 (constant) | 13,345 / 13,290 / 12,367 / 14,316 | 0.0172 / 0.0172 / 0.0167 / 0.0177 | 93.1% / 92.9% / 89.8% / 95.9% |
+| Reeve | 19 | 5,677 (constant) | 9,298 / 9,174 / 8,717 / 10,080 | 0.0052 / 0.0052 / 0.0049 / 0.0056 | 100% (all 10 runs) |
+| ratio (means) | 2.6x | 18.6x | 1.4x | 3.3x | |
+
+Calls, input tokens and (for Reeve) accuracy do not vary between runs, so their four statistics are the same number. Wall time per run: 93 to 102 s baseline, 54 to 62 s Reeve (sequential calls, local Meko).
+
+Where the baseline is wrong: fee decisions 72% (36 of 50 across runs), the planted exception 75% (15 of 20), plain "none" 94.6% (265 of 280), reminders and notices 100%; 15 of its 490 replies were not valid JSON with a known action and count as wrong. Reeve had no wrong decision, but that is partly by construction: its decisions run the same logic as the ground truth. What it does test is that Meko finds the owner's exception (20 of 20 holds).
+
+Compile, paid once: 2,844 input + 3,211 output tokens, US$0.0019 (mean of 3 Builder calls, none failed; in an aborted earlier run one draft failed conversion, a card missing a field, which the script now retries and counts). Extrapolated from the measured month, not measured: with the compile paid once, Reeve costs US$0.0071 for 1 month (2.4x cheaper), US$0.0175 for 3 months (2.9x) and US$0.0645 for 12 months (3.2x) against US$0.0172, US$0.0516 and US$0.2066 for the baseline; input tokens 8.5k / 19.9k / 71.0k against 105k / 316k / 1,265k.
+
+What it does not prove. One business, one SOP, one model, 10 runs, 49 events. The saving is large on input tokens (18.6x) and small on cost (3.3x): Haiku 5.5 spends most of its billed output on reasoning before it answers, and the Reeve Worker's wording call is billed the same way, so output tokens fall only 1.4x and output dominates the Reeve bill. The baseline's accuracy (93%) is good; the gap is on fees and the exception, not on routine reminders. The baseline got every advantage we could give it: no prompt caching on either side (a cached SOP and history prefix would cut the baseline input cost), history cut to what was known before each day, the same message wording task, the same model, parameters (SDK default temperature, max 1,200 output tokens) and sequential calls. A smarter baseline (retrieval instead of the whole history) would sit between the two arms; it was not run. Not counted: Meko's own cost (local here), the one-time Auditor/sandbox run, the owner's approval, and the Validator. Reeve's compiled rulebook is not what executes in this benchmark: decisions run the approved fixture cards in `rentTick`, so whether a Haiku compile reproduces them is a separate question (the Auditor's job). Cost uses the price table in `packages/llm` (Haiku 5.5, US$0.10 in and US$0.50 out per million tokens, standard tier). Total spend for the real run: about US$0.23 of a US$2.50 cap.
+
+Rerun: `npm run bench:tokens -- --fake` is an offline deterministic stub with a fake counter (4 characters per token; labelled "FAKE", not a measurement). Real: start local Meko (`meko start`), then `npm run bench:tokens -- --llm --runs=10` (needs `ANTHROPIC_API_KEY` in `.env`; `--fake-meko` for in-memory Meko; `--compiles=N`). It stops if the first baseline run costs over US$0.30 or the estimate passes US$2.50. Results: `.reeve/bench/tokens-*.json` (gitignored). The scoring and aggregation are covered by `apps/cli/test/token-bench.test.ts`.
+
 ### Beli bareng (group buying, `npm run groupbuy:demo`)
 
 Three minimarkets (pseudonymised M1 to M3) buy from one supplier (S1). Code batches their purchase orders per sku, prices every line at the supplier's volume tier and works out each owner's total and saving against buying alone. No model decides anything. Each owner consents first (`consent_group_buy`) and approves only their own line (`approve_group_line`, in their own workspace; the decision holds none of the others' quantities). A refusal drops that line and the batch is recomputed, so a tier can drop. After at least 2 approvals the batched order is placed as `place_group_order` in the shared workspace (receipt hashes and per-sku totals, no business names) through the Log connector. `verifyGroupOrder()` re-reads every receipt and checks the approved lines add up to the order; an edited line fails it.

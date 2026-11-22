@@ -26,6 +26,7 @@
     "crew:demo": "tsx --env-file-if-exists=.env apps/cli/src/crew-demo.ts",
     "groupbuy:demo": "env -u ANTHROPIC_BASE_URL tsx --env-file-if-exists=.env apps/cli/src/groupbuy-demo.ts",
     "gotong:demo": "env -u ANTHROPIC_BASE_URL tsx --env-file-if-exists=.env apps/cli/src/gotong-demo.ts",
+    "bench:tokens": "env -u ANTHROPIC_BASE_URL tsx --env-file-if-exists=.env apps/cli/src/token-bench.ts",
     "meko:seed": "tsx --env-file-if-exists=.env apps/cli/src/meko-seed.ts",
     "demo:minimarket": "tsx apps/cli/src/main.ts demo --pack=minimarket --llm=fixture",
     "demo:generic": "tsx apps/cli/src/main.ts demo --pack=bimbel-cerdas --llm=fixture",
