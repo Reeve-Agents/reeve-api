@@ -122,6 +122,14 @@ What it does not prove. One new business, one SOP, one model, N = 12 per arm, 24
 
 `npm run gotong:demo -- --fake` runs on in-memory Meko; `--runs=N` sets runs per arm; `--llm` uses Haiku (needs `ANTHROPIC_API_KEY`; refuses more than 30 LLM calls and stops if one run costs over US$0.05). Results go to `.reeve/gotong/results-*.json`.
 
+### Beli bareng (group buying, `npm run groupbuy:demo`)
+
+Three minimarkets (pseudonymised M1 to M3) buy from one supplier (S1). Code batches their purchase orders per sku, prices every line at the supplier's volume tier and works out each owner's total and saving against buying alone. No model decides anything. Each owner consents first (`consent_group_buy`) and approves only their own line (`approve_group_line`, in their own workspace; the decision holds none of the others' quantities). A refusal drops that line and the batch is recomputed, so a tier can drop. After at least 2 approvals the batched order is placed as `place_group_order` in the shared workspace (receipt hashes and per-sku totals, no business names) through the Log connector. `verifyGroupOrder()` re-reads every receipt and checks the approved lines add up to the order; an edited line fails it.
+
+Run it: start local Meko (`meko start`, see above), then `npm run groupbuy:demo` (`-- --fake` for in-memory Meko). It prints three scenarios (all agree, one refuses, one has not consented) with qty, line total, saving and receipt prefix per business.
+
+Limits: the POs are a small fixture, not real orders; the supplier tiers (5% from 50 units, 8% from 100 per sku) are assumptions, not a real price list; nothing is sent to a supplier and no money moves.
+
 ## Quick start
 
 Requires Node ≥ 20 and Python ≥ 3.9.
