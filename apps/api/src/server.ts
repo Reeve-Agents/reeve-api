@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
-import { anchorFromEnv } from "@reeve/anchor";
+import { anchorFromEnv, encodeAnchor } from "@reeve/anchor";
 import type { PackId } from "@reeve/core";
 import { ProviderRegistry } from "@reeve/llm";
 import { bimbelRecords, kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, minimarketScenario, PACK_FIXTURE, repoRoot, runAttempt } from "@reeve/pipeline";
@@ -59,6 +59,7 @@ const mekoDeps = {
   connect: () => connectMeko(mekoEndpoint),
   endpoint: mekoEndpoint,
   allowAsk: process.env.REEVE_MEKO_PUBLIC_ASK === "on",
+  encodeAnchor: (root: string, leaves: number) => encodeAnchor(root, leaves),
 };
 const mekoOpen = mekoOpener(mekoDeps);
 const mekoApp = createMekoApp(mekoDeps, mekoOpen);
@@ -74,6 +75,7 @@ const mekoOwner = createMekoOwnerApp(
     },
     template: () => loadFixtureRulebook(),
     telegram: mekoTg,
+    webOrigin: origin,
   },
   mekoOpen,
 );

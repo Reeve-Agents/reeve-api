@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { AskBusiness, buildRapor, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, paymentsFromRows, parsePaymentsCsv, raporHtml, SopDiscovery } from "@reeve/crew";
+import { AskBusiness, buildRapor, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, listShares, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -14,6 +14,8 @@ export interface MekoAppDeps {
   endpoint: { url: string; cloud: boolean };
   /** POST /ask writes an "explain" decision; off unless the deployment turns it on. */
   allowAsk?: boolean;
+  /** Anchor calldata encoder (@reeve/anchor), shown on the shared verify page. */
+  encodeAnchor?: (root: string, leaves: number) => string;
   /** Where the web app shows one decision. */
   explainUrl?: (receipt: string) => string;
 }
@@ -88,6 +90,12 @@ export function createMekoApp(deps: MekoAppDeps, open = mekoOpener(deps)) {
 
   app.get("/report.html", async (c) => c.html(raporHtml(await buildRapor(await open(), { from: c.req.query("from"), to: c.req.query("to") }), { explainUrl })));
 
+  // A Rapor shared by the owner: metrics plus the ledger, for the public verify page. 404 once revoked.
+  app.get("/shared/:token", async (c) => {
+    const r = await sharedRapor(await open(), c.req.param("token"), deps.encodeAnchor);
+    return r ? c.json(r) : c.json({ error: "Tautan ini tidak berlaku (dicabut pemilik atau tidak pernah ada)." }, 404);
+  });
+
   app.post("/ask", async (c) => {
     if (!deps.allowAsk) return c.json({ error: "Tanya usaha belum dibuka untuk umum di server ini." }, 403);
     const body = (await c.req.json().catch(() => ({}))) as { question?: string; role?: string; subject?: string };
@@ -105,6 +113,8 @@ export interface MekoOwnerDeps {
   audit?: (rb: Rulebook) => Promise<DiscoveryAudit>;
   /** The template SOP offered in "mode belajar". */
   template?: () => Rulebook;
+  /** Absolute web origin for share links. */
+  webOrigin?: string;
   /** Telegram tenant links and the wa.me fallback (meko-telegram.ts). */
   telegram?: { createLink(subject: string): unknown; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
 }
@@ -154,6 +164,19 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     const st = states.get(c.req.param("id"));
     if (!st) return c.json({ error: "Sesi discovery tidak ditemukan." }, 404);
     return c.json(await (await discovery()).finish(st, deps.audit, deps.template));
+  });
+
+  // Rapor share links (metrics only), revocable; live-or-not is read from the ledger.
+  app.get("/rapor/shares", async (c) => c.json({ shares: listShares(await open()) }));
+  app.post("/rapor/share", async (c) => {
+    const b = (await c.req.json().catch(() => ({}))) as { label?: string; from?: string; to?: string };
+    const date = (v?: string) => (v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined);
+    const s = await shareRapor(await open(), { label: b.label?.slice(0, 60), from: date(b.from), to: date(b.to), by: `account ${c.env?.account ?? "?"}` });
+    return c.json({ ...s, url: `${deps.webOrigin ?? ""}/?view=rapor&share=${s.token}` });
+  });
+  app.post("/rapor/revoke", async (c) => {
+    const { subject } = (await c.req.json().catch(() => ({}))) as { subject?: string };
+    return c.json({ receipt: await revokeShare(await open(), String(subject ?? ""), `account ${c.env?.account ?? "?"}`) });
   });
 
   // "Kenapa saya didenda?": a Telegram link code for one tenant, or the answer as a wa.me link.
