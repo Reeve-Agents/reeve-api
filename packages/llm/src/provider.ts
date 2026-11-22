@@ -6,6 +6,8 @@ export interface SopHints {
   connectors?: string[];
   /** Real tools found on the connected services for this SOP's actions, with the arguments each requires. */
   tools?: { slug: string; description?: string; required: string[] }[];
+  /** Anonymised patterns learned across other businesses (Gotong Royong): short plain sentences, no names, no amounts. Absent means the prompt is unchanged. */
+  sharedHints?: string[];
 }
 
 /** Tokens of one model call, as the provider reported them. The offline sample reports zeros. */
