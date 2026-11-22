@@ -96,6 +96,32 @@ Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/
 
 Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
 
+### Gotong Royong: shared learning across businesses (`npm run gotong:demo`)
+
+Businesses that consent pool what their first drafts taught the Builder, as anonymous aggregate patterns in one project-level datapack (`reeve-gotong-royong`). A new business's Builder reads the pool before it drafts.
+
+- **Consent.** `consentShare` is an owner decision (`consent_share_patterns`) with a receipt, per kind of pattern, revocable. A business that has not consented contributes nothing (`withheld`).
+- **Patterns.** `extractPatterns` derives them from real pipeline runs (Builder, Auditor, sandbox) of each business's first drafts: planted-defect kinds planted and surviving, and why first drafts were rejected. An aggregate behind fewer than 2 businesses is dropped. Dropped on purpose, and reported: content hooks (only Kos Melati runs content and its reach numbers are simulated, so k = 1) and reminder times (the crew records the day of a reminder, not its time).
+- **Publish.** `publish` writes each pattern as promoted memory with a receipt that holds counts, kinds and consent-receipt hashes only. A leak check refuses any business name, alias, amount, phone or id. All of this is plain code; no model decides whether to share.
+- **Read.** `readForNewBusiness` runs `context_search` on the pool and returns short hint sentences (composed by code from the counts). `parseSop(..., { sharedHints })` adds them to the Builder's prompt as an advisory block; with no hints the prompt is byte-for-byte unchanged. The Builder's compile step stays deterministic, so the only place hints can matter is the model's rule cards (the first draft).
+
+Measured on a new business, "laundry kiloan" (a SOP of 6 rules incl. an owner-approval limit, 12 records; `apps/cli/fixtures/laundry-kiloan`). Claude Haiku 5.5, local Meko, 12 runs per arm, interleaved, first attempt only (no repair loop), 22 Nov 2026:
+
+| | without hints | with hints |
+|---|---|---|
+| First draft passed the Auditor | 4 of 12 | 12 of 12 |
+| Blockers per draft (mean / median / min / max) | 0.67 / 1 / 0 / 1 | 0 / 0 / 0 / 0 |
+| Planted-defect survivors on the first attempt (mean / median / min / max) | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Input tokens per run (mean / median / min / max) | 3,934 / 3,934 / 3,934 / 3,934 | 4,136 / 4,136 / 4,136 / 4,136 |
+| Output tokens per run (mean / median / min / max) | 4,869 / 4,865 / 4,299 / 5,420 | 4,856 / 4,769 / 4,346 / 5,603 |
+| Cost per run | $0.0028 | $0.0028 |
+
+What it shows. The 8 failures without hints are the same blocker: an approval-limit card with no rule naming the amount field (`RULEBOOK_INVALID`, rejected before anything runs). The pool held exactly that pattern (1 of 9 first drafts across 3 businesses), the hint states it, and with it 12 of 12 drafts passed. The hint costs 202 input tokens and no extra output. On planted-defect survivors the result is null: no first draft in either arm, and none of the 9 first drafts in the pool, left a planted defect alive, because the Auditor derives its spec from the cards. So "defect kinds that usually survive" has no data to teach and the claim is not made.
+
+What it does not prove. One new business, one SOP, one model, N = 12 per arm, 24 calls (plus a 2-call pilot, 26 of the 30-call cap, about US$0.07). The failure the hint prevents was seen in one of the pool's own drafts (a Haiku draft of the Bimbel SOP) and the laundry SOP has the same kind of approval rule, so this is the best case for a hint, not a typical one. The pool is built from saved first drafts of three businesses and three models, not from a long-running fleet. The hint text is a template filled by code, not learned wording. The fixture mode (`npm run gotong:demo`, the default) returns the same rulebook in both arms: it is deterministic, proves the wiring (hints reach the prompt, 589 more characters) and the consent, k >= 2 and leak checks, and shows no effect by design. In the demo all workspaces share one ledger file; in production each business keeps its own, and only the pool's workspace is shared.
+
+`npm run gotong:demo -- --fake` runs on in-memory Meko; `--runs=N` sets runs per arm; `--llm` uses Haiku (needs `ANTHROPIC_API_KEY`; refuses more than 30 LLM calls and stops if one run costs over US$0.05). Results go to `.reeve/gotong/results-*.json`.
+
 ## Quick start
 
 Requires Node ≥ 20 and Python ≥ 3.9.
