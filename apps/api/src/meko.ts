@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { AskBusiness, buildRapor, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -118,6 +118,8 @@ export interface MekoOwnerDeps {
   /** Telegram tenant links and the wa.me fallback (meko-telegram.ts). */
   /** Store of the Meko workspace; the review queue and the autonomy ladder live under `data.meko_review` / `data.meko_ladder`. */
   store?: { data: object; save(): void };
+  /** SOP amendments (self-learning loop). Default: the REEVE_SOP_AMENDMENTS flag, off unless set. */
+  amend?: { enabled?: () => boolean; env?: Record<string, string | undefined>; history?: () => History | null };
   telegram?: { createLink(subject: string): unknown; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
 }
 
@@ -301,6 +303,53 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     needStore().save();
     return c.json({ cls, level: to });
   });
+
+  // SOP amendments: repeated owner exceptions -> a tested proposal -> the owner decides. With the
+  // flag off the list is empty and nothing can be decided. Approving saves a rulebook version and sends nothing.
+  const amendOn = () => (deps.amend?.enabled ?? (() => amendmentsEnabled(deps.amend?.env)))();
+  const amendView = (a: ReturnType<typeof loadAmendments>[number]) => {
+    const { rulebook_after: _rb, ...rest } = a;
+    return rest;
+  };
+  const amending = new Set<string>();
+
+  app.get("/amendments", (c) => {
+    if (!amendOn()) return c.json({ enabled: false, items: [], pending: 0, threshold: SHORTFALL_MIN, exceptions: 0, open_shortfalls: 0 });
+    const data = needStore().data;
+    const items = loadAmendments(data);
+    const rank = (i: { status: string }) => (i.status === "pending" ? 0 : 1);
+    const sorted = [...items].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.created_at.localeCompare(b.created_at) : (b.decided_at ?? "").localeCompare(a.decided_at ?? "")));
+    return c.json({ enabled: true, items: sorted.slice(0, 50).map(amendView), pending: items.filter((i) => i.status === "pending").length, threshold: SHORTFALL_MIN, exceptions: loadExceptions(data).length, open_shortfalls: localShortfalls(loadExceptions(data)).length });
+  });
+
+  app.post("/amendments/scan", async (c) => {
+    if (!amendOn()) return c.json({ enabled: false, error: "Usulan perubahan SOP belum diaktifkan di server ini." }, 409);
+    if (!deps.audit) return c.json({ error: "Pengujian belum tersedia di server ini." }, 409);
+    const store = needStore();
+    const out = await scanAmendments(await open(), store.data, { audit: deps.audit, template: deps.template ?? (() => { throw new Error("Tidak ada SOP dasar di server ini."); }), history: deps.amend?.history?.() ?? null, env: deps.amend?.env });
+    store.save();
+    return c.json({ path: out.path, note: out.note, shortfalls: out.shortfalls.length, offered: out.results.filter((r) => r.result.offered).length });
+  });
+
+  for (const action of ["approve", "reject"] as const)
+    app.post(`/amendments/:id/${action}`, async (c) => {
+      if (!amendOn()) return c.json({ enabled: false, error: "Usulan perubahan SOP belum diaktifkan di server ini." }, 409);
+      const store = needStore();
+      const id = c.req.param("id");
+      const item = loadAmendments(store.data).find((a) => a.id === id);
+      if (!item) return c.json({ error: "Usulan tidak ditemukan." }, 404);
+      if (item.status !== "pending" || amending.has(id)) return c.json({ error: "Usulan ini sudah diputuskan." }, 409);
+      amending.add(id);
+      try {
+        const ws = await open();
+        // Owner confirmed while signed in; a step-up passkey ceremony is a follow-up (as for the ladder).
+        const done = action === "approve" ? await approveAmendment(ws, store.data, id, { method: "session", credential_id: by(c) }, by(c)) : await rejectAmendment(ws, store.data, id, by(c));
+        store.save();
+        return c.json({ receipt: done.decision_receipt, item: amendView(done), note: action === "approve" ? "Aturan baru disimpan sebagai versi SOP. Belum ada pesan terkirim." : "Usulan ditolak. SOP tidak berubah." });
+      } finally {
+        amending.delete(id);
+      }
+    });
 
   return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }) };
 }

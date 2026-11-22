@@ -16,3 +16,4 @@ export * from "./share";
 export * from "./owner-state";
 export * from "./gotong";
 export * from "./groupbuy";
+export * from "./amend";

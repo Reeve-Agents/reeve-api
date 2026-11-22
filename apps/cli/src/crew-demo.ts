@@ -6,6 +6,8 @@
 //
 //   npm run crew:demo                   # local Meko, templates only (no LLM cost)
 //   npm run crew:demo -- --llm          # Worker on Claude Haiku 5.5 (needs ANTHROPIC_API_KEY)
+//   npm run crew:demo -- --amend        # also seed repeated owner exceptions and one pending SOP amendment
+//                                       # (run the API with REEVE_SOP_AMENDMENTS=on to see it)
 //   npm run crew:demo -- --fresh        # drop the demo datapack and ledger first
 //   npm run crew:demo -- --ledger=pg    # ledger in Postgres (DATABASE_URL), as the deployed API reads it
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -13,6 +15,7 @@ import { join, resolve } from "node:path";
 import {
   AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
+  amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
 } from "@reeve/crew";
 import { filePersistence } from "../../api/src/persistence";
@@ -188,6 +191,25 @@ for (let i = 0; i < 6 && c.state.status === "running"; i++) {
     return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
   });
   say(`discovery: ${st.candidates.length} candidates, replay ${st.replay.agree}/${st.replay.bills}, mode ${res.mode}, audit ${res.audit?.killed}/${res.audit?.total}`);
+}
+
+// 6b2. --amend: the owner keeps granting the same exception ("boleh telat sampai 15 hari"), so Reeve
+// proposes an SOP amendment, the Auditor tests it with the planted defects, and it waits for the owner.
+if (args.has("--amend")) {
+  const data = opened.store.data;
+  await recordException(ws, data, { rule_id: "R3", reason: izin, subject: "K03", month: "2026-12" });
+  for (const [subject, month, days] of [["K03", "2026-08", 12], ["K05", "2026-09", 14], ["K08", "2026-10", 15]] as const)
+    await recordException(ws, data, { rule_id: "R3", reason: `Kamar ${Number(subject.slice(1))} boleh telat sampai ${days} hari, izin pemilik.`, subject, month });
+  const out = await scanAmendments(ws, data, {
+    audit: async (rb) => {
+      const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `amend-${Date.now().toString(36)}` });
+      return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
+    },
+    template: () => rulebook,
+    history: amendSampleHistory(),
+  });
+  say(`amend: ${loadExceptions(data).length} exceptions, ${out.shortfalls.length} shortfall(s) [${out.path}]`);
+  for (const r of out.results) say(`  ${r.shortfall.rule_id} ${r.shortfall.label} x${r.shortfall.count}: ${r.result.offered ? `offered ${r.result.amendment.id} (${r.result.amendment.audit.killed}/${r.result.amendment.audit.total} defects, ${r.result.amendment.improvement?.summary})` : r.result.reason}`);
 }
 
 // 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder.
