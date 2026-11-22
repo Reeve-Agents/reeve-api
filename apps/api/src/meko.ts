@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -120,7 +120,12 @@ export interface MekoOwnerDeps {
   store?: { data: object; save(): void };
   /** SOP amendments (self-learning loop). Default: the REEVE_SOP_AMENDMENTS flag, off unless set. */
   amend?: { enabled?: () => boolean; env?: Record<string, string | undefined>; history?: () => History | null };
-  telegram?: { createLink(subject: string): unknown; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
+  telegram?: { createLink(subject: string): unknown; createOwnerLink?(): unknown; ownerLinked?(): boolean; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
+  /** What runs a staged action once its 10-minute window has passed. Default: the Log connector (nothing is sent). */
+  outbox?: { execute?: (tool: string, args: Record<string, unknown>) => Promise<ExecResult> };
+  /** Where the daily digest goes. Default: dry run (text only). Live Telegram needs TELEGRAM_BOT_TOKEN + REEVE_DIGEST=on. */
+  digest?: { sender?: DigestSender };
+  now?: () => number;
 }
 
 /**
@@ -206,7 +211,67 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
   const getLadder = async () => (ladder ??= new Ladder(await open(), loadLadderState(needStore().data)));
   const deciding = new Set<string>();
 
+  const clock = () => deps.now?.() ?? Date.now();
+  const logExec = deps.outbox?.execute ?? (async (): Promise<ExecResult> => ({ ok: true, via: "log" }));
+  let box: Outbox | null = null;
+  const getOutbox = async () => (box ??= new Outbox(await open(), needStore(), await getLadder()));
+  /** Runs what is due (through the injected connector), then returns the outbox. */
+  const settled = async () => {
+    const b = await getOutbox();
+    await b.flush(clock(), logExec);
+    return b;
+  };
+  const sender = () => deps.digest?.sender ?? dryRun;
+  const webOrigin = () => deps.webOrigin ?? "";
+  const digestFor = async (date?: string) => {
+    const ws = await open();
+    const day = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : wibDate(clock());
+    await settled();
+    return buildDigest(ws, await getLadder(), needStore(), day, { webOrigin: webOrigin() });
+  };
+
   const view = (i: ReturnType<typeof loadReview>[number]) => ({ ...i, action_class: stepOf(i.step)?.action_class ?? (i.kind === "contract" ? "accept_tenant" : "review"), step_title: stepOf(i.step)?.title ?? i.step });
+
+  // Auto-run actions wait 10 minutes in the outbox; undo cancels one for real, after that it has run.
+  app.get("/outbox", async (c) => {
+    await settled();
+    const now = clock();
+    const label = (cls: string) => DEFAULT_POLICIES[cls]?.label ?? cls;
+    const all = loadOutbox(needStore().data).map((i) => ({ id: i.id, action_class: i.action_class, label: label(i.action_class), tool: i.tool, subject: i.subject, status: i.status, staged_at: i.staged_at, due_at: i.due_at, seconds_left: i.status === "staged" ? Math.max(0, Math.ceil((Date.parse(i.due_at) - now) / 1000)) : 0, stage_receipt: i.stage_receipt, done_receipt: i.done_receipt, undo_receipt: i.undo_receipt, via: i.via }));
+    const open_ = all.filter((i) => i.status === "staged" || i.status === "running").sort((a, b2) => a.seconds_left - b2.seconds_left);
+    const recent = all.filter((i) => i.status !== "staged" && i.status !== "running").sort((a, b2) => (b2.staged_at < a.staged_at ? -1 : 1)).slice(0, 20);
+    return c.json({ window_seconds: UNDO_WINDOW_MS / 1000, items: [...open_, ...recent], staged: open_.length });
+  });
+
+  app.post("/outbox/:id/undo", async (c) => {
+    const b = await settled();
+    try {
+      const r = await b.undo(c.req.param("id"), clock());
+      return c.json({ receipt: r.receipt, level: r.level, item: r.item, note: "Dibatalkan. Tindakan ini tidak pernah dikirim; kelasnya turun satu level." });
+    } catch (e) {
+      if (e instanceof UndoRefused) return c.json({ error: e.message }, e.code === "missing" ? 404 : 409);
+      throw e;
+    }
+  });
+
+  // The daily digest: built by code from ledger facts. Previewing sends nothing; the wa.me link is
+  // opened by the owner. /digest/send is a dry run unless TELEGRAM_BOT_TOKEN and REEVE_DIGEST=on are set.
+  app.get("/digest", async (c) => {
+    const d = await digestFor(c.req.query("date"));
+    const sent = (needStore().data as { meko_digest?: Record<string, { receipt: string; channel: string; delivered: boolean }> }).meko_digest?.[d.date] ?? null;
+    return c.json({ ...d, wa_me: `https://wa.me/?text=${encodeURIComponent(d.text)}`, channel: { telegram_linked: deps.telegram?.ownerLinked?.() ?? false, live: sender().live, name: sender().channel }, sent });
+  });
+
+  app.post("/digest/send", async (c) => {
+    const d = await digestFor();
+    const r = await sendDigest({ ws: await open(), ladder: await getLadder(), store: needStore(), date: d.date, webOrigin: webOrigin() }, sender());
+    return c.json({ ...r, note: r.delivered ? "Ringkasan terkirim lewat Telegram." : "Dry-run: tidak ada pesan terkirim. Buka tautan WhatsApp untuk mengirim sendiri." });
+  });
+
+  app.post("/telegram/owner-link", (c) => {
+    if (!deps.telegram?.createOwnerLink) return c.json({ error: "Telegram belum diatur di server ini (TELEGRAM_WEBHOOK_SECRET)." }, 409);
+    return c.json(deps.telegram.createOwnerLink());
+  });
 
   app.get("/review", (c) => {
     const items = loadReview(needStore().data);
@@ -351,5 +416,5 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
       }
     });
 
-  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }) };
+  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }), /** Digest text for today, for the owner's /ringkasan on Telegram. */ digestText: async () => (await digestFor()).text };
 }

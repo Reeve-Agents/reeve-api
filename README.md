@@ -142,6 +142,14 @@ Flags. `REEVE_SOP_AMENDMENTS=on` (off by default) enables `GET /api/meko/owner/a
 
 Limits: one kind of change (a later late-fee day) is automated; other exception reasons are counted but not turned into a rule change. The improvement is measured on the demo's synthetic three-month history, which was written so the owner follows the SOP except for those exceptions; on real history the replay may well show other differences, and the page shows them. The audit proves the amended rules are internally consistent, not that the new tolerance is a good business decision. In the amended demo rulebook the notice (H+14) comes before the fee (H+15); the diff says so.
 
+### Ketenangan pemilik (calm for the owner)
+
+Two things so the owner is not pinged all day. Digest: one message per day, built by code from ledger facts (no LLM): what ran by itself per class, what is staged and can still be undone, how many drafts wait, amendment proposals pending, ledger intact yes/no, a link to `/?view=kendali`. Counts and pseudonymous facts only, never a tenant name. `sendDigest` records one `send_digest` decision per day (output `{date, hash, channel, delivered}`); a second call the same day returns the first receipt and sends nothing. Undo window, done truthfully: an auto-run action is not executed at once. `Outbox.stage` writes it to `meko_outbox` with `due_at = now + 10 min` (decision `auto_stage`); `flush` runs it once through the injected connector after that (decision `auto_run`, the clean evidence for the ladder); `undo` before `due_at` cancels it so it never runs, records an `undo` receipt that links the staged one, and drops the class one level. After the window undo is refused ("Sudah terkirim, tidak bisa dibatalkan"). In the demo the connector is the Log connector, so nothing is really sent; `crew:demo` leaves two reminders past the window and two inside it.
+
+Routes (session-guarded): `GET /api/meko/owner/outbox`, `POST .../outbox/:id/undo`, `GET .../digest` (text, a `wa.me` link the owner opens and sends themselves, channel status), `POST .../digest/send`. The page is Kendali ("Ringkasan hari ini", "Jalan sendiri, bisa dibatalkan"). The owner can bind their own Telegram chat (`POST .../telegram/owner-link`, code subject `PEMILIK`; tenant links stay `K05`-style) and send `/ringkasan`: the digest comes back as the webhook reply, so no bot token is needed.
+
+What is dry-run: `/digest/send` returns the text and sends nothing. A real Telegram push needs all of `TELEGRAM_BOT_TOKEN`, `REEVE_DIGEST=on` and `TELEGRAM_OWNER_CHAT_ID`; any one missing means dry run. That live path is unit-tested with an injected fetch only and has never been run against Telegram. The API flushes the outbox when the owner page or the digest is read, not on a timer, so a due item runs on the next read.
+
 ## Quick start
 
 Requires Node ≥ 20 and Python ≥ 3.9.

@@ -98,7 +98,7 @@ export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: 
     usaha: {
       fees: { count: fees.length, amount_idr: fees.reduce((s, e) => s + (Number(e.reasoning.match(/= Rp(\d+)/)?.[1]) || 0), 0) },
       exceptions_honoured: count((e) => e.action === "hold"),
-      reminders: count((e) => e.action === "remind"),
+      reminders: count((e) => e.action === "remind" || (e.action === "auto_run" && e.action_class === "reminder")),
       deposits: { count: deposits.length, amount_idr: deposits.reduce((s, e) => s + (Number(e.reasoning.match(/Deposit Rp(\d+)/)?.[1]) || 0), 0) },
       rooms_filled: count((e) => e.action === "accept_tenant"),
       replies_auto: count((e) => e.action === "reply"),

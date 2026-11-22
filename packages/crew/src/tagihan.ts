@@ -97,8 +97,8 @@ export async function rentTick(run: MekoRun, bills: TenantBill[], today: string,
     const d = await op.decide({
       input: `${b.id} kamar ${b.room}: telat ${late} hari`,
       output: { action, via: res.via, autonomy: gate },
-      reasoning: wantsNotice ? `Rule R4: day ${late} late is the notice day.` : `Rule R2: reminders on day ${cards.reminder_days.join(" and ")}; today is day ${late}.${gate === "ask" ? " The reminder class is still at 'ask', so it waits for the owner." : ""}`,
-      action: gate === "ask" ? "ask_owner" : action,
+      reasoning: wantsNotice ? `Rule R4: day ${late} late is the notice day.` : `Rule R2: reminders on day ${cards.reminder_days.join(" and ")}; today is day ${late}.${gate === "ask" ? " The reminder class is still at 'ask', so it waits for the owner." : res.via === "staged" ? " The message is staged for the 10-minute undo window; it counts as a clean run only once it has run." : ""}`,
+      action: gate === "ask" ? "ask_owner" : res.via === "staged" ? "remind_staged" : action,
       action_class: action === "notice" ? "notice" : "reminder",
       subject: b.id,
     });

@@ -13,7 +13,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
+  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
   amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
@@ -124,6 +124,20 @@ await rentTick(run, earlier, "2026-11-04", { execute: (tool, a) => execute("log"
 for (const today of ["2026-12-04", "2026-12-08", "2026-12-11"]) {
   const out = await rentTick(run, bills, today, { execute: (tool, a) => execute("log", tool, a), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
   say(`tick ${today}: ${out.filter((o) => o.action !== "none").map((o) => `${o.id} ${o.action}`).join(", ")}`);
+}
+
+// 2b. Auto reminders are STAGED for the 10-minute undo window, not sent at once. A fake clock puts
+// two of them past the window (the Log connector runs them, exactly once) and two inside it, so the
+// owner page shows both: a live countdown with "Batalkan" and "Sudah jalan". Nothing is really sent.
+{
+  const outbox = new Outbox(ws, opened.store, ladder);
+  const t0 = Date.now();
+  const ages = [26, 13, 4, 1].map((m) => t0 - m * 60_000);
+  let n = 0;
+  const staged: TenantBill[] = ["K41", "K42", "K43", "K44"].map((id, i) => ({ id, room: String(41 + i), due: day, paid: false, tenure_months: 4 }));
+  await rentTick(run, staged, "2026-12-04", { execute: async (tool, a) => (await outbox.stage({ action_class: "reminder", tool, args: a, subject: String(a.to) }, ages[n++]!), { ok: true, via: "staged" }), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
+  const ran = await outbox.flush(t0, (tool, a) => execute("log", tool, a));
+  say(`outbox: ${staged.length} reminders staged, ${ran.length} past the 10-minute window ran (Log connector), ${outbox.items().filter((i) => i.status === "staged").length} can still be undone`);
 }
 
 // 3. "Kenapa saya didenda?" on WhatsApp, answered by the read-only agent from the trace.
