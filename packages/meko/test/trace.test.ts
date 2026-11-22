@@ -32,6 +32,31 @@ describe("Meko trace", () => {
     expect([...meko.packs.values()].sort()).toEqual(["reeve-kos-melati", "reeve-minimarket"]);
   });
 
+  it("bootstraps the datapack on Meko Cloud, where a conversation needs a datapack id", async () => {
+    const meko = new FakeMeko(["datapack_search", "track_token_usage"]);
+    meko.requireDatapack = true;
+    const a = await MekoWorkspace.open(meko, { workspace: "kos-melati", ledger: ledgerAt() });
+    const b = await MekoWorkspace.open(meko, { workspace: "kos-melati", ledger: ledgerAt() });
+    expect(a.datapackId).toBe(b.datapackId);
+    expect([...meko.packs.values()]).toEqual(["reeve-kos-melati"]);
+    expect(meko.calls).not.toContain("datapack_list");
+    const op = await a.run("run_cloud_1").agent("operator", "Tick");
+    const d = await op.decide({ input: "kamar 3", output: { action: "hold" }, reasoning: "izin pemilik", action: "hold", usage: { name: "operator_reasoning", model: "fixture", input_tokens: 4, output_tokens: 2 } });
+    expect(meko.usage[0]).toMatchObject({ total_tokens: 6, message_id: d.message_id });
+  });
+
+  it("uses MEKO_DATAPACK_ID on Cloud and explains a refused datapack_create", async () => {
+    const meko = new FakeMeko(["datapack_search", "track_token_usage"]);
+    meko.requireDatapack = true;
+    const ws = await MekoWorkspace.open(meko, { workspace: "kos-melati", ledger: ledgerAt(), env: { MEKO_DATAPACK_ID: "11111111-2222-3333-4444-555555555555" } });
+    expect(ws.datapackId).toBe("11111111-2222-3333-4444-555555555555");
+    expect(meko.packs.size).toBe(0);
+    const refusing = new FakeMeko(["datapack_search", "track_token_usage"]);
+    const orig = refusing.call.bind(refusing);
+    refusing.call = async (tool, args) => (tool === "datapack_create" ? { error: "INTERNAL_ERROR", detail: "Could not create the datapack." } : orig(tool, args));
+    await expect(MekoWorkspace.open(refusing, { workspace: "kos-melati", ledger: ledgerAt(), env: {} })).rejects.toThrow(/MEKO_DATAPACK_ID/);
+  });
+
   it("ties agents by run_id, each in its own session, with receipts both ways", async () => {
     const { meko, ledger, d, hits } = await chain();
     const convs = [...meko.convs.values()].filter((c) => c.run_id === "run_test_1");

@@ -88,6 +88,8 @@ export interface WorkspaceOptions {
   ledger: Ledger;
   pseudonyms?: Pseudonymiser;
   now?: () => Date;
+  /** Where MEKO_DATAPACK_ID[_<WORKSPACE>] is read from (default: process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 export class MekoWorkspace {
@@ -109,15 +111,40 @@ export class MekoWorkspace {
     return `reeve-${workspace}`;
   }
 
-  /** Finds or creates the workspace's datapack. Meko wants a conversation on every call, so open a setup one first. */
+  /**
+   * Finds or creates the workspace's datapack. Local Meko wants a conversation on every call, so a setup one comes
+   * first. Meko Cloud is the other way round: a conversation needs a datapack id (`datapack_id_required`), while
+   * datapack_search / datapack_create only want a non-empty conversation_id, so a placeholder id bootstraps it.
+   */
   static async open(transport: MekoTransport, opts: WorkspaceOptions): Promise<MekoWorkspace> {
-    const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}` }), "conversation_id", "id");
     const name = MekoWorkspace.datapackName(opts.workspace);
-    const find = async () => {
-      const listed = await transport.call("datapack_list", { conversation_id: setup, limit: 200 });
-      const packs = (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
-      return packs.find((p) => (p.datapack_name ?? p.name) === name);
-    };
+    const tools = await transport.tools();
+    const cloud = tools.includes("datapack_search") && tools.includes("track_token_usage");
+    const packsOf = (listed: unknown) => (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
+    const named = (packs: Record<string, unknown>[]) => packs.find((p) => (p.datapack_name ?? p.name) === name);
+    if (cloud) {
+      const boot = "0".repeat(32);
+      // An explicit id wins: MEKO_DATAPACK_ID_<WORKSPACE> (e.g. MEKO_DATAPACK_ID_KOS_MELATI), else MEKO_DATAPACK_ID.
+      const env = opts.env ?? process.env;
+      const explicit = env[`MEKO_DATAPACK_ID_${opts.workspace.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] || env.MEKO_DATAPACK_ID;
+      let datapackId = explicit;
+      if (!datapackId) {
+        const find = async () => named(packsOf(await transport.call("datapack_search", { name, conversation_id: boot })));
+        let hit = await find();
+        if (!hit) {
+          const created = (await transport.call("datapack_create", { conversation_id: boot, name })) as Record<string, unknown>;
+          if (created.error && created.error !== "CONFLICT") {
+            throw new Error(`meko: Meko Cloud would not create datapack "${name}" (${String(created.error)}: ${String(created.detail ?? "").slice(0, 120)}). Create one in the Meko Cloud app and set MEKO_DATAPACK_ID to its UUID.`);
+          }
+          hit = created.error === "CONFLICT" ? await find() : created;
+        }
+        datapackId = str(hit, "datapack_id", "id");
+      }
+      const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}`, datapack_id: datapackId }), "conversation_id", "id");
+      return new MekoWorkspace(transport, opts.workspace, opts.ledger, datapackId, setup, opts);
+    }
+    const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}` }), "conversation_id", "id");
+    const find = async () => named(packsOf(await transport.call("datapack_list", { conversation_id: setup, limit: 200 })));
     let hit = await find();
     if (!hit) {
       const created = (await transport.call("datapack_create", { conversation_id: setup, name })) as Record<string, unknown>;
