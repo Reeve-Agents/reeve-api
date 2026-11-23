@@ -1,5 +1,5 @@
 // "Verify this decision": recompute the trace hash from what Meko stores now, compare it with the
-// ledger, check the hash chain, and check the Merkle proof against the latest anchor that covers it.
+// ledger, check the hash chain, and check the Merkle proof against the anchor that covers it (bestAnchor).
 import { anchorLeaves, type AnchorBody, type DecisionBody, type LedgerEntry, merkleProof, merkleRoot, verifyProof } from "@reeve/receipts";
 import { type MekoMessage, type MekoWorkspace, type TraceBody, traceHash } from "./trace";
 
@@ -44,6 +44,16 @@ export function anchorProof(entries: LedgerEntry[], decision: LedgerEntry, opts:
   return { seq: anchor.seq, merkle_root: anchor.merkle_root, tx: anchor.tx, explorer: anchor.explorer, proof_ok };
 }
 
+/**
+ * The anchor the Rapor and the Jejak page both show for one decision: the first anchor after it that was published
+ * on a chain (it has a tx or explorer link) when its proof holds, otherwise the first anchor after it of any kind
+ * (a local Merkle root). One function, so the two pages cannot name different anchors for the same receipt.
+ */
+export function bestAnchor(entries: LedgerEntry[], decision: LedgerEntry): DecisionCheck["checks"]["anchored"] {
+  const chain = anchorProof(entries, decision, { onchain: true });
+  return chain?.proof_ok ? chain : anchorProof(entries, decision);
+}
+
 export async function verifyDecision(ws: MekoWorkspace, receiptHash: string): Promise<DecisionCheck> {
   const entries = ws.ledger.entries();
   const decision = entries.find((e): e is LedgerEntry & DecisionBody => e.kind === "decision" && e.entry_hash === receiptHash);
@@ -52,7 +62,7 @@ export async function verifyDecision(ws: MekoWorkspace, receiptHash: string): Pr
   if (!decision) return { ...base, ok: false, problem: "Receipt ini tidak ada di ledger." };
   const conv = await ws.conversation(decision.agent, decision.conversation_id);
   const message = conv.messages.find((m) => m.metadata?.reeve_receipt === receiptHash);
-  const anchored = anchorProof(entries, decision);
+  const anchored = bestAnchor(entries, decision);
   if (!message) return { ...base, decision, ok: false, problem: "Pesan jejak keputusan tidak ditemukan di Meko.", checks: { ...base.checks, anchored } };
   const trace_matches = traceHash(traceBodyOf(decision, message)) === decision.trace_hash;
   const ok = ledger_intact && trace_matches && (anchored ? anchored.proof_ok : true);

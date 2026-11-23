@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { anchorLeaves, merkleRoot } from "@reeve/receipts";
+import { bestAnchor, verifyDecision } from "@reeve/meko";
 import { buildRapor, isOnchainAnchor, raporHtml, storeRapor } from "../src/index";
 import { testDeps } from "./helpers";
 
@@ -57,6 +58,31 @@ describe("Rapor anchor labels", () => {
     const r = await buildRapor(ws);
     expect(r.totals).toMatchObject({ anchored: 1, anchored_onchain: 1 });
     expect(r.anchors.map((a) => isOnchainAnchor(a))).toEqual([false, true]);
+  });
+
+  it("the Rapor and the verify page name the same anchor: a local root followed by an on-chain one", async () => {
+    const { ws, ledger } = await withDecision();
+    appendLocal(ledger);
+    const leaves = anchorLeaves(ledger.entries());
+    ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: merkleRoot(leaves), leaves: leaves.length, anchor: "monad-testnet", tx: "0xfeed", explorer: "https://testnet.monadexplorer.com/tx/0xfeed" });
+    const decision = ws.decisions()[0]!;
+    const r = await buildRapor(ws);
+    const check = await verifyDecision(ws, decision.entry_hash);
+    const onchain = ledger.entries().filter((e) => e.kind === "anchor").at(-1)!;
+    expect(r.decisions[0]!.anchored).toMatchObject({ seq: onchain.seq, tx: "0xfeed", proof_ok: true });
+    expect(check.checks.anchored).toMatchObject({ seq: onchain.seq, tx: "0xfeed", proof_ok: true });
+    expect(check.checks.anchored).toEqual(bestAnchor(ledger.entries(), decision));
+    expect(check.ok).toBe(true);
+  });
+
+  it("falls back to the local root for both when no on-chain anchor covers the decision", async () => {
+    const { ws, ledger } = await withDecision();
+    appendLocal(ledger);
+    const decision = ws.decisions()[0]!;
+    const r = await buildRapor(ws);
+    const check = await verifyDecision(ws, decision.entry_hash);
+    expect(r.decisions[0]!.anchored!.tx).toBeUndefined();
+    expect(check.checks.anchored).toMatchObject({ seq: r.decisions[0]!.anchored!.seq, proof_ok: true });
   });
 
   it("renders a Rapor stored before anchored_onchain existed", async () => {

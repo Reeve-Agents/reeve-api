@@ -3,7 +3,7 @@
 // exception check, verification result and anchor. Stored as a Meko artifact by SHA-256.
 import type { AnchorBody, DecisionBody, LedgerEntry } from "@reeve/receipts";
 import { weakSearches, type WeakSearches } from "./weak";
-import { anchorProof, type MekoMessage, type MekoWorkspace, traceBodyOf, traceHash } from "@reeve/meko";
+import { bestAnchor, type MekoMessage, type MekoWorkspace, traceBodyOf, traceHash } from "@reeve/meko";
 
 export interface RaporEntry {
   seq: number;
@@ -89,12 +89,6 @@ function sentTokens(e: RaporEntry, seenChars: number): { n: number; billed: bool
 
 /** An anchor entry published on a chain carries a tx hash and/or an explorer link; a local Merkle root has neither. */
 export const isOnchainAnchor = (a: { tx?: string; explorer?: string } | null | undefined): boolean => !!(a && (a.tx || a.explorer));
-
-/** The on-chain anchor that covers the decision when there is one; otherwise the local Merkle root. */
-function bestAnchor(entries: LedgerEntry[], d: LedgerEntry): RaporEntry["anchored"] {
-  const chain = anchorProof(entries, d, { onchain: true });
-  return chain?.proof_ok ? chain : anchorProof(entries, d);
-}
 
 const RULE = /\b(R\d{1,2}\b|b\d_[a-z_]+|c\d_[a-z_]+|bound_[a-z_]+)/;
 
