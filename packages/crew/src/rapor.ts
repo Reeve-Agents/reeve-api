@@ -3,7 +3,7 @@
 // exception check, verification result and anchor. Stored as a Meko artifact by SHA-256.
 import type { AnchorBody, DecisionBody, LedgerEntry } from "@reeve/receipts";
 import { weakSearches, type WeakSearches } from "./weak";
-import { anchorProof, type MekoMessage, type MekoWorkspace, traceBodyOf, traceHash } from "@reeve/meko";
+import { bestAnchor, type MekoMessage, type MekoWorkspace, traceBodyOf, traceHash } from "@reeve/meko";
 
 export interface RaporEntry {
   seq: number;
@@ -30,7 +30,16 @@ export interface Rapor {
   generated_at: string;
   period: { from: string; to: string };
   ledger_intact: boolean;
-  totals: { decisions: number; verified: number; tampered: number; anchored: number; by_agent: Record<string, number>; by_action: Record<string, number> };
+  totals: {
+    decisions: number;
+    verified: number;
+    tampered: number;
+    /** Decisions inside a Merkle root of any kind (local or on-chain). */
+    anchored: number;
+    /** Of those, decisions inside a Merkle root that was published on a chain (the anchor entry has a tx). */
+    anchored_onchain: number;
+    by_agent: Record<string, number>; by_action: Record<string, number>;
+  };
   usaha: {
     fees: { count: number; amount_idr: number };
     exceptions_honoured: number;
@@ -78,6 +87,9 @@ function sentTokens(e: RaporEntry, seenChars: number): { n: number; billed: bool
   return { n: Math.ceil((e.input.length + seenChars) / 4), billed: false };
 }
 
+/** An anchor entry published on a chain carries a tx hash and/or an explorer link; a local Merkle root has neither. */
+export const isOnchainAnchor = (a: { tx?: string; explorer?: string } | null | undefined): boolean => !!(a && (a.tx || a.explorer));
+
 const RULE = /\b(R\d{1,2}\b|b\d_[a-z_]+|c\d_[a-z_]+|bound_[a-z_]+)/;
 
 export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: string; now?: Date } = {}): Promise<Rapor> {
@@ -111,7 +123,7 @@ export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: 
       tokens_saved: Number(m?.metadata?.reeve_tokens_saved ?? 0),
       usage,
       verified,
-      anchored: anchorProof(entries, d),
+      anchored: bestAnchor(entries, d),
     });
   }
   const count = (f: (e: RaporEntry) => boolean) => out.filter(f).length;
@@ -125,7 +137,7 @@ export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: 
     generated_at: (opts.now ?? new Date()).toISOString(),
     period: { from: decisions[0]?.at.slice(0, 10) ?? from, to: decisions.at(-1)?.at.slice(0, 10) ?? to },
     ledger_intact: ws.ledger.verify() === null,
-    totals: { decisions: out.length, verified: count((e) => e.verified), tampered: count((e) => !e.verified), anchored: count((e) => !!e.anchored?.proof_ok), by_agent: tally("agent"), by_action: tally("action") },
+    totals: { decisions: out.length, verified: count((e) => e.verified), tampered: count((e) => !e.verified), anchored: count((e) => !!e.anchored?.proof_ok), anchored_onchain: count((e) => !!e.anchored?.proof_ok && isOnchainAnchor(e.anchored)), by_agent: tally("agent"), by_action: tally("action") },
     usaha: {
       fees: { count: fees.length, amount_idr: fees.reduce((s, e) => s + (Number(e.reasoning.match(/= Rp(\d+)/)?.[1]) || 0), 0) },
       exceptions_honoured: count((e) => e.action === "hold"),
@@ -186,7 +198,7 @@ export async function storeRapor(ws: MekoWorkspace, rapor: Rapor): Promise<{ con
   const d = await t.decide({
     input: `rapor ${rapor.period.from}..${rapor.period.to}`,
     output: { artifact: art.content_hash, decisions: rapor.totals.decisions, verified: rapor.totals.verified, tampered: rapor.totals.tampered },
-    reasoning: `The report is built from ${rapor.totals.decisions} ledger decisions and their Meko traces; ${rapor.totals.verified} recompute to the hash in their receipt, ${rapor.totals.anchored} are inside an anchored Merkle root.`,
+    reasoning: `The report is built from ${rapor.totals.decisions} ledger decisions and their Meko traces; ${rapor.totals.verified} recompute to the hash in their receipt, ${rapor.totals.anchored_onchain} are inside a Merkle root published on-chain and ${rapor.totals.anchored - rapor.totals.anchored_onchain} only inside a local Merkle root (not published on a chain, so it does not yet prove the ledger was not rewritten).`,
     action: "rapor",
   });
   return { content_hash: art.content_hash, receipt: d.receipt_hash };
@@ -217,10 +229,13 @@ export function raporHtml(r: Rapor, opts: { explainUrl?: (receipt: string) => st
   const t = (id: string, en: string) => `<span data-l="id">${esc(id)}</span><span data-l="en">${esc(en)}</span>`;
   const url = opts.explainUrl ?? ((h: string) => `/?view=jejak&receipt=${h}`);
   const u = r.usaha;
+  const onchainN = r.totals.anchored_onchain ?? 0; // absent in a Rapor stored before the field existed
+  const localOnly = r.totals.anchored - onchainN;
   const tiles: [string, string, string][] = [
     ["Keputusan tercatat", "Decisions recorded", String(r.totals.decisions)],
     ["Terverifikasi", "Verified", `${r.totals.verified}/${r.totals.decisions}`],
-    ["Di dalam anchor", "Anchored", String(r.totals.anchored)],
+    ...(onchainN > 0 ? [["Di dalam anchor on-chain", "Anchored on-chain", String(onchainN)] as [string, string, string]] : []),
+    ...(localOnly > 0 || onchainN === 0 ? [["Di dalam Merkle root lokal", "In a local Merkle root", String(localOnly)] as [string, string, string]] : []),
     ["Kamar terisi", "Rooms filled", String(u.rooms_filled)],
     ["Deposit ditagih", "Deposits billed", rp(u.deposits.amount_idr)],
     ["Denda", "Late fees", `${u.fees.count} · ${rp(u.fees.amount_idr)}`],
@@ -231,13 +246,28 @@ export function raporHtml(r: Rapor, opts: { explainUrl?: (receipt: string) => st
     ["Hemat token input vs konteks penuh", "Input tokens saved vs full context", `${r.savings.saved.toLocaleString("id-ID")}${r.savings.ratio ? ` (${r.savings.ratio}×)` : ""}`],
     ["Panggilan Worker", "Worker calls", String(r.tokens.worker_calls)],
   ];
+  const anchorIntro: [string, string] =
+    onchainN > 0
+      ? [
+          `anchor on-chain (root Merkle yang dipublikasikan di blockchain testnet) membuktikan receipt tidak diubah sesudahnya.${localOnly > 0 ? " Receipt yang hanya masuk Merkle root lokal belum punya bukti itu." : ""}`,
+          `the on-chain anchor (a Merkle root published on a testnet) proves the receipt was not changed afterwards.${localOnly > 0 ? " A receipt that is only inside a local Merkle root does not have that proof yet." : ""}`,
+        ]
+      : r.totals.anchored > 0
+        ? [
+            "Merkle root lokal hanya mendeteksi perubahan pada receipt selama ledgernya tidak ditulis ulang; root ini belum dipublikasikan on-chain, jadi belum menjadi bukti dari pihak ketiga.",
+            "a local Merkle root only detects a change to a receipt as long as the ledger itself is not rewritten; it has not been published on-chain, so it is not third-party proof yet.",
+          ]
+        : ["belum ada anchor, jadi belum ada bukti bahwa receipt tidak diubah sesudahnya.", "there is no anchor yet, so nothing proves a receipt was not changed afterwards."];
+  const anchorMark = (a: NonNullable<RaporEntry["anchored"]>) => (isOnchainAnchor(a) ? `${t("anchor on-chain", "anchored on-chain")}${a.explorer ? ` (<a href="${esc(a.explorer)}">tx</a>)` : ""}` : t("Merkle root lokal", "local Merkle root"));
   const rows = r.decisions
     .map((d) => {
       const [id, en] = ACTION_ID[d.action ?? ""] ?? [d.action ?? "-", d.action ?? "-"];
-      return `<tr><td>${esc(d.at.slice(0, 16).replace("T", " "))}</td><td>${esc(d.agent)}</td><td>${t(id, en)}</td><td>${esc(d.subject ?? "")}</td><td>${esc(d.rule ?? "")}</td><td class="why">${esc(d.reasoning)}</td><td>${d.verified ? t("cocok", "match") : `<b class="bad">${t("berubah", "changed")}</b>`}${d.anchored?.proof_ok ? ` · ${t("anchor", "anchored")}` : ""}</td><td><a href="${esc(url(d.receipt))}"><code>${esc(d.receipt.slice(0, 10))}</code></a></td></tr>`;
+      return `<tr><td>${esc(d.at.slice(0, 16).replace("T", " "))}</td><td>${esc(d.agent)}</td><td>${t(id, en)}</td><td>${esc(d.subject ?? "")}</td><td>${esc(d.rule ?? "")}</td><td class="why">${esc(d.reasoning)}</td><td>${d.verified ? t("cocok", "match") : `<b class="bad">${t("berubah", "changed")}</b>`}${d.anchored?.proof_ok ? ` · ${anchorMark(d.anchored)}` : ""}</td><td><a href="${esc(url(d.receipt))}"><code>${esc(d.receipt.slice(0, 10))}</code></a></td></tr>`;
     })
     .join("");
-  const anchors = r.anchors.map((a) => `<li><code>${esc(a.merkle_root.slice(0, 16))}…</code> · ${a.leaves} leaves · ${esc(a.anchor)}${a.explorer ? ` · <a href="${esc(a.explorer)}">tx</a>` : ""}</li>`).join("") || `<li>${t("Belum ada anchor.", "No anchor yet.")}</li>`;
+  const anchors = r.anchors
+    .map((a) => `<li><code>${esc(a.merkle_root.slice(0, 16))}…</code> · ${a.leaves} leaves · ${isOnchainAnchor(a) ? `${t("anchor on-chain", "anchored on-chain")} (${esc(a.anchor)})${a.explorer ? ` · <a href="${esc(a.explorer)}">tx</a>` : ""}` : t("Merkle root lokal, belum dipublikasikan on-chain", "local Merkle root, not published on-chain")}</li>`)
+    .join("") || `<li>${t("Belum ada anchor.", "No anchor yet.")}</li>`;
   return `<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rapor Usaha · ${esc(r.workspace)}</title>
 <style>
 :root{--bg:#000b16;--ink:#f6f7ed;--mute:#b9bdb4;--fill:#001f3f;--fill2:#012a52;--accent:#dbe64c;--on-accent:#001f3f;--blue:#1e488f;--link:#a9c1f2;--bad:#ff9b94;--sep:#1c2f45}
@@ -256,7 +286,7 @@ html[data-lang=id] [data-l=en],html[data-lang=en] [data-l=id]{display:none}
 <button onclick="var h=document.documentElement;h.dataset.lang=h.dataset.lang==='en'?'id':'en'">ID / EN</button>
 <h1>${t("Rapor Usaha", "Business report")} · ${esc(r.workspace)}</h1>
 <p class="mute">${t("Periode", "Period")} ${esc(r.period.from)} – ${esc(r.period.to)} · ${t("dibuat", "generated")} ${esc(r.generated_at.slice(0, 16).replace("T", " "))} UTC · ${t("Rantai ledger", "Ledger chain")}: ${r.ledger_intact ? t("utuh", "intact") : `<b class="bad">${t("rusak", "broken")}</b>`}</p>
-<p>${t("Setiap baris adalah keputusan agen yang tercatat di Meko dan di ledger Reeve. Reeve menghitung ulang hash jejak dari Meko dan membandingkannya dengan receipt; anchor membuktikan receipt tidak diubah sesudahnya.", "Every row is an agent decision recorded in Meko and in the Reeve ledger. Reeve recomputes each trace hash from Meko and compares it with its receipt; the anchor proves the receipt was not changed afterwards.")}</p>
+<p>${t("Setiap baris adalah keputusan agen yang tercatat di Meko dan di ledger Reeve. Reeve menghitung ulang hash jejak dari Meko dan membandingkannya dengan receipt; ", "Every row is an agent decision recorded in Meko and in the Reeve ledger. Reeve recomputes each trace hash from Meko and compares it with its receipt; ")}${t(anchorIntro[0], anchorIntro[1])}</p>
 <div class="tiles">${tiles.map(([a, b, v]) => `<div class="tile">${t(a, b)}<b>${esc(v)}</b></div>`).join("")}</div>
 <h2>${t("Keputusan per agen", "Decisions per agent")}</h2>
 <div class="bars">${Object.entries(r.totals.by_agent)

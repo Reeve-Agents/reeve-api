@@ -52,7 +52,7 @@ export interface AccountDeps {
   sessionSecret?: string;
   /** Supabase Auth for the magic-link backup (project URL and a secret or service-role key). */
   supabase?: { url: string; key: string } | null;
-  /** Read-only public apps served without a session, by path prefix (the Meko demo workspace). */
+  /** Apps served without a session, by path prefix: the read-only Meko demo workspace, and the secret-gated billing tick (each route checks its own secret). */
   publicApps?: { prefix: string; fetch: (req: Request) => Response | Promise<Response> }[];
   /** Tried before the workspaces for an inbound webhook (the Meko demo's Telegram tenants); null passes it on. */
   webhookFirst?: (req: Request) => Promise<Response | null>;

@@ -16,7 +16,8 @@ Reeve's agents now do work, not only watch: they fill a vacant room, run daily c
 **Try it live (no account, no key, no passkey):**
 - Decision traces: https://reeve-web-delta.vercel.app/?view=jejak. Every decision, its reasoning from the Meko trace, and a "Cek" that recomputes the hashes against Meko.
 - Rapor Usaha, the audit report built from traces and receipts, with an ID/EN toggle: https://production-reeve-backend.tyzo.nodeops.app/api/meko/public/report.html.
-- What the live data is: the Kos Melati demo, seeded on Meko Cloud on 23 Nov 2026. It holds 108 decisions, all verified against their receipts, and 107 of them sit inside an anchored Merkle root.
+- What the live data is: the Kos Melati demo, seeded on Meko Cloud on 23 Nov 2026. It holds 108 decisions, all verified against their receipts, and 107 of them sit inside a local Merkle root (the ledger's own hash tree, recorded in the ledger). A Merkle root is published on-chain only when the anchor entry carries a transaction hash; the Rapor says which one each row has.
+- Where it comes from, said plainly: the data comes from one seed run, not from months of use. Messages go to the Log connector (recorded, not sent), the deposit uses a mock rail, and the owner approvals in it are marked `demo` (no passkey).
 
 > **What existed before 7 Nov 2026.** The Builder, the Auditor with planted defects, the Operator (broker), the payment rails, the receipt ledger, the Monad testnet anchor and the web studio were built before ContextCon, for earlier hackathons (this repo was imported on 20 Oct 2026). Everything Meko-related is new and lives on branch `feat/meko-active-crew`, in dated commits from 21 Nov 2026: `packages/meko`, `packages/crew`, `apps/api/src/meko.ts`, `apps/cli/src/crew-demo.ts`, the `decision` ledger entry and the `?view=jejak` page in reeve-web.
 
@@ -61,7 +62,7 @@ flowchart LR
   - The owner taps Ya/Tidak on each card. Each tap is a trace plus a receipt.
   - Confirmed cards go through the normal audit with planted defects. Fewer than 3 confirmed keeps Reeve in "mode belajar": it watches and suggests only.
 - **Telegram tenants**:
-  - A one-time code links a tenant's chat. Only an HMAC of the chat id is kept.
+  - A one-time code links a tenant's chat. Only an HMAC of the chat id is kept, unless `TELEGRAM_BOT_TOKEN` is set (the live billing tick below needs it): then the chat id is also kept per pseudonym so the bot can write first. A link made before that is upgraded by the tenant's next message to the bot.
   - "Kenapa saya didenda?" is answered from the trace with a "lihat bukti" link. The answer is a traced decision too.
   - WhatsApp stays a `wa.me` link the owner sends by hand.
 - **Rapor share links** (`?view=rapor&share=`):
@@ -80,7 +81,11 @@ meko start
 npm run crew:demo -- --fresh
 ```
 
-Meko Cloud: `npm run meko:seed` (needs `MEKO_API_KEY`; `--local` rehearses on local Meko; `--ledger=pg` writes the ledger where the deployed API reads it).
+Meko Cloud: `npm run meko:seed` (needs `MEKO_API_KEY`; `--local` rehearses on local Meko; `--ledger=pg` writes the ledger where the deployed API reads it). What the seed runs on depends on the environment, and it logs which:
+- **Sandbox**: the Auditor's planted defects run in the sandbox `REEVE_SANDBOX` picks (the same factory the API uses). `REEVE_SANDBOX=createos` (with `CREATEOS_API_KEY`) runs them in a CreateOS microVM; without it they run in the local dev sandbox, a subprocess with no isolation. The Auditor's decision records `sandbox: "createos" | "local"` in its output. `--sandbox=local|createos` overrides the env.
+- **Anchor**: with `REEVE_ANCHOR_PRIVATE_KEY` (and `REEVE_ANCHOR_CHAIN`, `monad-testnet` by default, optional `REEVE_ANCHOR_RPC_URL`) the Merkle root of this workspace's ledger is published as a real testnet transaction; `tx` and `explorer` are recorded on the anchor entry and the Rapor says "anchor on-chain". Any chain that is not a known testnet is refused, and an unfunded wallet fails before the run starts. Without a key the root is only a local Merkle root and the seed, the Rapor and this README say so. `--no-anchor` writes none.
+- **LLM**: `--llm` words the drafts with Claude Haiku 5.5 (`ANTHROPIC_API_KEY`).
+- **Live bills**: the five demo tenants' bills for the billing tick below.
 
 Where Meko Cloud differs from local Meko (all handled in `packages/meko`, checked on 23 Nov 2026 with real seeds on an emptied datapack: 107 traced decisions, 107 verified; the production seed (`--ledger=pg`) gave the same):
 - **Datapack.** A conversation needs a `datapack_id`, and a new account has none. Reeve searches by name (`datapack_search`, any non-empty `conversation_id` works as bootstrap), then tries `datapack_create`. If Cloud refuses (it did: `INTERNAL_ERROR`), create a datapack in the Meko app and set `MEKO_DATAPACK_ID` (or `MEKO_DATAPACK_ID_<WORKSPACE>`).
@@ -98,6 +103,29 @@ npm run dev
 
 Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/api/meko/public/report.html`. Add `--llm` to let Claude Haiku 5.5 word the drafts (needs `ANTHROPIC_API_KEY`). For Meko Cloud set `MEKO_API_KEY` (and optionally `MEKO_MCP_URL`) in `.env`; without it the local Meko and `meko token` are used. `REEVE_MEKO_PUBLIC_ASK=on` opens `POST /api/meko/public/ask`.
 
+### Live billing tick (`POST /api/meko/tick`)
+
+The seed also writes the five Kos Melati demo tenants' bills into the workspace store (K03, K05, K08 and K17 unpaid, K12 paid, with their tenure), due on the 1st of the month it ran in (Asia/Jakarta). The due day is one constant (`KOS_DUE_DAY = 1`, the SOP's "tagihan dikirim setiap tanggal 1"): the live bills, the monthly roll and the generated contract ("jatuh tempo setiap tanggal 1") all read it, and the late fee counts H+7 from it. The deployed API runs the same `rentTick` over them, so the demo has a loop that keeps going after the seed.
+
+| What | How |
+|---|---|
+| `POST /api/meko/tick` | Runs today's tick (today = the date in Asia/Jakarta) over the stored bills, saves the bill state, and answers with what it did per bill (`remind`, `notice`, `charge_fee`, `hold`, `none`, and the decision recorded) plus the receipts. **Idempotent per day**: a second call the same day stages and records nothing new for the bills and returns the first result with `repeated: true`. **Resumable**: each bill's progress is saved as soon as it is done, so a tick that failed midway (the route answered 503) is finished by calling it again the same day, without staging any reminder twice. It only runs staged reminders whose 10-minute window has passed. |
+| `POST /api/meko/bills/:id/paid` | The owner records that tenant `:id` (K05) paid this month's rent. The bill gets no reminder, notice or fee until the next month, a reminder of it still in its 10-minute window is cancelled, and the decision (`mark_paid`) is a Meko trace and a ledger receipt. Calling it again records nothing (`already: true`). A new month starts every bill unpaid again (rent is monthly). 404 for an unknown bill. |
+| Auth | Both routes need the header `x-reeve-tick-secret` equal to `REEVE_TICK_SECRET` (constant-time compare), and **no session is accepted**: they cause sends, and any self-registered account could otherwise call them. Otherwise 401, and with `REEVE_TICK_SECRET` unset both are 401 for everyone. 409 when the seed wrote no bills. Errors answer with a generic message; the detail goes to the server log. |
+| `REEVE_MEKO_TICK=on` | In-process scheduler: one tick shortly after start-up (only when it is 08:00 WIB or later and today's tick is not done; a start at night waits for 08:00 WIB), then one every day at about 08:00 WIB, and a minute timer that runs staged reminders once their window has passed. Safe with restarts (per-day idempotency). Without it, call the route from a cron with the secret. **Run one API instance**: the day's claim lives in that process's copy of the store, so two instances ticking the same day would both run it. |
+| `TELEGRAM_BOT_TOKEN` | A reminder that runs is sent with the Bot API `sendMessage` to the tenant's linked Telegram chat and recorded `via: "telegram"`. No token, or the tenant has no linked chat: `via: "log"`. A Telegram error is recorded as a failed run, never as sent. |
+| `REEVE_TICK_SECRET` | Secret for the two routes above (cron, and the owner's "sudah bayar" call). Set it as a long random value; it is never logged. |
+
+```bash
+curl -X POST https://<api>/api/meko/tick -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
+curl -X POST https://<api>/api/meko/bills/K05/paid -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
+```
+
+Rules it follows: the **autonomy ladder** decides. While "Pengingat" is at `ask` (the default) a due reminder is recorded as `ask_owner` and nothing is staged; once the owner moves it up, a reminder is **staged for 10 minutes** (undo in the owner app) and only then sent. A month that starts rolls the bills to its due day (the 1st): nobody has paid yet, no fee charged, tenure one month longer.
+
+**Live**: the daily tick over stored bills, every decision a Meko trace and a ledger receipt, the ladder and the 10-minute undo, and Telegram reminders to tenants who linked a chat.
+**Still log or demo**: tenants without a linked Telegram chat (and every WhatsApp message) go to the Log connector, which records and does not send; late fees are recorded decisions only, nothing is charged or collected; a bill is paid only because the owner said so (`POST /api/meko/bills/:id/paid`; no payment rail is read for it) and a new month starts everyone unpaid; the seed's owner approvals are marked `demo`; the seed's deposit uses a mock rail.
+
 ### Measured on Kos Melati (local Meko 1.20261116.0, 21 Nov 2026, `crew:demo --llm`)
 
 | | |
@@ -109,7 +137,7 @@ Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/
 | Model calls | 6 of 79 turns, all wording drafts; no model call decides whether to act |
 | `context_search` | 26 searches before acting |
 
-Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
+Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected, except Telegram reminders from the live billing tick when `TELEGRAM_BOT_TOKEN` is set; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
 
 ### Gotong Royong: shared learning across businesses (`npm run gotong:demo`)
 

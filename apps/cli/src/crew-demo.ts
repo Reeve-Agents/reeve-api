@@ -1,8 +1,13 @@
-// Seeds the Meko demo workspace "kos-melati": the real SOP audit (61 planted defects, local
-// sandbox), rent ticks with an owner exception, "kenapa saya didenda?", a payment-plan bound,
-// Playbook B (kamar kosong) and Playbook C (konten) end to end, then an anchor and the Rapor Usaha.
-// Synthetic, pseudonymised data only. No real message is sent (Log connector), the rail is the
-// mock or Xendit test mode, and the owner's passkey is marked "demo".
+// Seeds the Meko demo workspace "kos-melati": the real SOP audit (61 planted defects, in the sandbox
+// REEVE_SANDBOX picks: the CreateOS microVM, or the local dev sandbox), rent ticks with an owner
+// exception, "kenapa saya didenda?", a payment-plan bound, Playbook B (kamar kosong) and Playbook C
+// (konten) end to end, then an anchor and the Rapor Usaha. Synthetic, pseudonymised data only. No real
+// message is sent (Log connector), the rail is the mock or Xendit test mode, and the owner's passkey is
+// marked "demo". It also writes the five demo tenants' bills for the live billing tick (POST /api/meko/tick).
+//
+// The anchor: with REEVE_ANCHOR_PRIVATE_KEY (and REEVE_ANCHOR_CHAIN, a testnet) the ledger's Merkle root
+// is published as a real testnet transaction; without it the root is only a local Merkle root, said so.
+// `--no-anchor` skips it; `--sandbox=local|createos` overrides REEVE_SANDBOX.
 //
 //   npm run crew:demo                   # local Meko, templates only (no LLM cost)
 //   npm run crew:demo -- --llm          # Worker on Claude Haiku 5.5 (needs ANTHROPIC_API_KEY)
@@ -13,7 +18,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
+  AskBusiness, approveBound, buildRapor, demoBills, dueDateWib, saveBillBook, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
   amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
@@ -23,8 +28,7 @@ import { AnthropicProvider } from "@reeve/llm";
 import { connectMeko, mekoEndpointFromEnv, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import { kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, repoRoot, runAttempt } from "@reeve/pipeline";
 import { MockRail } from "@reeve/rails";
-import { anchorLeaves, Ledger, merkleRoot } from "@reeve/receipts";
-import { LocalSandbox } from "@reeve/sandbox";
+import { chooseAnchor, preflightAnchor, seedSandbox, writeSeedAnchor } from "./seed-lib";
 
 const args = new Set(process.argv.slice(2));
 const WS = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
@@ -36,6 +40,12 @@ const DEMO = { method: "demo" as const, credential_id: "demo-owner" };
 const endpoint = mekoEndpointFromEnv();
 const meko = await connectMeko(endpoint);
 say(`Meko: ${endpoint.cloud ? "Cloud" : "local"} (${endpoint.url})`);
+
+// Where the planted defects run, and what the ledger's Merkle root gets: decided (and checked) before the long run.
+const { sandbox, kind: sandboxKind } = seedSandbox(process.env, process.argv.slice(2).find((a) => a.startsWith("--sandbox="))?.slice("--sandbox=".length));
+say(`Auditor sandbox: ${sandboxKind}${sandboxKind === "local" ? " (dev only, no isolation; REEVE_SANDBOX=createos with CREATEOS_API_KEY uses the CreateOS microVM)" : " (CreateOS microVM)"}`);
+const anchorChoice = chooseAnchor(process.env, { skip: args.has("--no-anchor") });
+say(await preflightAnchor(anchorChoice));
 
 // The deployed API reads the demo ledger from Postgres; a seed for it must write there too.
 const pgLedger = args.has("--ledger=pg");
@@ -81,8 +91,8 @@ const day = "2026-12-01";
 // Unique per seed: Meko Cloud keeps conversations for good and dedups on the session id (workspace:agent:run), so a second seed must not reuse the first one's.
 const run = ws.run(`run_kos_${day.replaceAll("-", "")}_${Date.now().toString(36)}`);
 const rulebook = loadFixtureRulebook("kos-melati");
-say("auditing the Kos Melati SOP in the local sandbox ...");
-const attempt = await runAttempt({ repoRoot, rulebook, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `meko-${Date.now().toString(36)}` });
+say(`auditing the Kos Melati SOP in the ${sandboxKind} sandbox ...`);
+const attempt = await runAttempt({ repoRoot, rulebook, scenario: kosMelatiScenario(), sandbox, runId: `meko-${Date.now().toString(36)}` });
 const mut = attempt.results?.mutation ?? { killed: 0, total: 0 };
 const builder = await run.agent("builder", "Compile SOP: tagihan Kos Melati");
 const sop = loadFixtureSop("kos-melati");
@@ -94,11 +104,11 @@ await builder.decide({
   action: "compile",
 });
 const auditor = await run.agent("auditor", "Audit SOP: tagihan Kos Melati");
-const verdictArt = await auditor.artifact("audit-kos-melati.json", { verdict: attempt.verdict, spec_cases: attempt.plan.cases.length, mutation: mut, receipt: attempt.receipt.receipt_hash });
+const verdictArt = await auditor.artifact("audit-kos-melati.json", { verdict: attempt.verdict, spec_cases: attempt.plan.cases.length, mutation: mut, receipt: attempt.receipt.receipt_hash, sandbox: sandboxKind });
 await auditor.decide({
   input: `rules.py ${attempt.compiled.rulebookHash.slice(0, 12)}`,
-  output: { status: attempt.verdict.status, spec_cases: attempt.plan.cases.length, planted_defects: `${mut.killed}/${mut.total}`, artifact: verdictArt.content_hash, run_receipt: attempt.receipt.receipt_hash },
-  reasoning: `${attempt.plan.cases.length} spec cases written from the rulebook (not the Builder's tests) and ${mut.killed}/${mut.total} planted defects caught in the sandbox, including boundary mutants at H+7, so the rules can go to the owner.`,
+  output: { status: attempt.verdict.status, spec_cases: attempt.plan.cases.length, planted_defects: `${mut.killed}/${mut.total}`, sandbox: sandboxKind, ...(attempt.run.sandboxId ? { sandbox_id: attempt.run.sandboxId } : {}), artifact: verdictArt.content_hash, run_receipt: attempt.receipt.receipt_hash },
+  reasoning: `${attempt.plan.cases.length} spec cases written from the rulebook (not the Builder's tests) and ${mut.killed}/${mut.total} planted defects caught in the ${sandboxKind === "createos" ? "CreateOS microVM sandbox" : "local dev sandbox (a subprocess, no isolation)"}, including boundary mutants at H+7, so the rules can go to the owner.`,
   action: attempt.verdict.status === "pass" ? "audit_pass" : "audit_fail",
 });
 ledger.append({ kind: "receipt", at: new Date().toISOString(), receipt_hash: attempt.receipt.receipt_hash, run_id: attempt.runId, verdict: attempt.verdict.status });
@@ -110,13 +120,7 @@ say(`SOP audit ${attempt.verdict.status}: ${mut.killed}/${mut.total} planted def
 const izin = "Kamar 3 boleh telat sampai 10 hari untuk tagihan Desember 2026, izin pemilik.";
 await owner.remember(izin, { kind: "owner_exception", room: "3", until: "2026-12-31" }, { promote: true });
 await owner.decide({ input: "Penghuni kamar 3 (K03) minta izin telat bayar Desember", output: { exception: izin, shared: true }, reasoning: "The owner granted a one-month exception; it is promoted to shared memory so the Operator, Builder and WhatsApp replies all see it.", action: "grant_exception", action_class: "exception", subject: "K03" });
-const bills: TenantBill[] = [
-  { id: "K03", room: "3", due: day, paid: false, tenure_months: 5 },
-  { id: "K05", room: "5", due: day, paid: false, tenure_months: 3 },
-  { id: "K08", room: "8", due: day, paid: false, tenure_months: 14 },
-  { id: "K12", room: "12", due: day, paid: true, tenure_months: 8 },
-  { id: "K17", room: "17", due: day, paid: false, tenure_months: 2 },
-];
+const bills: TenantBill[] = demoBills(day);
 const ladder = new Ladder(ws);
 // Earlier in the month 18 more reminders went out by themselves without a complaint: with the ones
 // below, "Pengingat bayar" has the 20 clean receipts that let Reeve ask the owner to move it up.
@@ -202,7 +206,7 @@ for (let i = 0; i < 6 && c.state.status === "running"; i++) {
   const st = await disc.start({ chat: sample.chat, payments: parsePaymentsCsv(sample.payments), business: "Kos Melati" });
   for (const c of st.candidates) await disc.answer(st, c.id, c.id !== "R8", "demo seed");
   const res = await disc.finish(st, async (rb) => {
-    const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `discovery-${Date.now().toString(36)}` });
+    const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox, runId: `discovery-${Date.now().toString(36)}` });
     return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
   });
   say(`discovery: ${st.candidates.length} candidates, replay ${st.replay.agree}/${st.replay.bills}, mode ${res.mode}, audit ${res.audit?.killed}/${res.audit?.total}`);
@@ -217,7 +221,7 @@ if (args.has("--amend")) {
     await recordException(ws, data, { rule_id: "R3", reason: `Kamar ${Number(subject.slice(1))} boleh telat sampai ${days} hari, izin pemilik.`, subject, month });
   const out = await scanAmendments(ws, data, {
     audit: async (rb) => {
-      const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `amend-${Date.now().toString(36)}` });
+      const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox, runId: `amend-${Date.now().toString(36)}` });
       return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
     },
     template: () => rulebook,
@@ -227,15 +231,19 @@ if (args.has("--amend")) {
   for (const r of out.results) say(`  ${r.shortfall.rule_id} ${r.shortfall.label} x${r.shortfall.count}: ${r.result.offered ? `offered ${r.result.amendment.id} (${r.result.amendment.audit.killed}/${r.result.amendment.audit.total} defects, ${r.result.amendment.improvement?.summary})` : r.result.reason}`);
 }
 
-// 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder.
+// 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder,
+// and the live bill set the billing tick runs over: the same five tenants, due on the due day (KOS_DUE_DAY) of this month (Asia/Jakarta).
+const liveBills = saveBillBook(opened.store.data, demoBills(dueDateWib(Date.now())));
+say(`live bills: ${liveBills.bills.length} tenants (${liveBills.bills.filter((b) => !b.paid).length} unpaid) due ${liveBills.bills[0]!.due}; POST /api/meko/tick runs rentTick over them`);
 saveReview(opened.store.data, [...b.state.queue, ...c.state.queue]);
 saveLadderState(opened.store.data, ladder.state);
 opened.store.save();
 say(`owner state: ${b.state.queue.length + c.state.queue.length} review items (${[...b.state.queue, ...c.state.queue].filter((q) => q.status === "pending").length} pending), ladder ${JSON.stringify(Object.fromEntries(Object.entries(ladder.state.levels).map(([k, v]) => [k, v.level])))}`);
 
-// 7. Anchor the ledger (local; `npm run anchor:now` publishes the root on Monad testnet).
-const leaves = anchorLeaves(ledger.entries());
-ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: merkleRoot(leaves), leaves: leaves.length, anchor: "local-ledger" });
+// 7. Anchor THIS workspace's ledger: a real testnet transaction when the anchor wallet is configured,
+// otherwise a local Merkle root that is labelled local (the Rapor says "Merkle root lokal", never "anchor on-chain").
+const anchored = await writeSeedAnchor(ledger, anchorChoice);
+say(`anchor: ${anchored.note}`);
 
 // 8. Verify everything, then the Rapor Usaha (stored in Meko as an artifact).
 const all = ws.decisions();

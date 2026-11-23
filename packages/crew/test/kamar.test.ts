@@ -1,6 +1,6 @@
 import { verifyDecision } from "@reeve/meko";
 import { describe, expect, it } from "vitest";
-import { classify, KamarKosong, newState, nextSlot, playbookB } from "../src/index";
+import { classify, demoBills, dueDateWib, KamarKosong, KOS_DUE_DAY, KOS_RENT_CARDS, lateFeeContractClause, Ladder, liveTick, loadBillBook, newState, nextSlot, Outbox, playbookB, rentTick, saveBillBook } from "../src/index";
 import { DEMO_PASSKEY, testDeps } from "./helpers";
 
 describe("Playbook B: kamar kosong terisi sendiri", () => {
@@ -39,6 +39,51 @@ describe("Playbook B: kamar kosong terisi sendiri", () => {
     const actions = ws.decisions().map((d) => d.action);
     expect(actions).toEqual(expect.arrayContaining(["compile_playbook", "audit_pass", "approve_playbook", "start_listing", "validator_pass", "publish", "reply", "escalate", "book_viewing", "deposit_bill", "contract_draft", "accept_tenant"]));
     for (const d of crew.state.decisions) expect((await verifyDecision(ws, d.receipt_hash)).ok).toBe(true);
+  });
+
+  it("writes the contract's late fee from the rule, the same amount rentTick charges", async () => {
+    const { deps, rail, ws } = await testDeps();
+    const crew = new KamarKosong(deps, newState(playbookB()));
+    await crew.approveB(DEMO_PASSKEY);
+    await crew.prospectMessage("p3", "Sari", "9", "jadwal survei kapan?");
+    await crew.viewingDone("p3", true);
+    await rail.simulatePayment(crew.prospects.p3!.invoice!.id);
+    const contract = await crew.depositPaid("p3");
+    const fee = Math.round((KOS_RENT_CARDS.rent_idr * KOS_RENT_CARDS.late_fee.percent) / 100);
+    expect(fee).toBe(75_000);
+    expect(contract.text).toContain(`denda ${KOS_RENT_CARDS.late_fee.percent}% dari sewa (Rp75.000)`);
+    expect(contract.text).toContain("kecuali ada izin pemilik");
+    expect(contract.text).toContain("minimal 12 bulan dapat toleransi 3 hari tambahan");
+    expect(contract.text).not.toContain("Rp50.000");
+    expect(lateFeeContractClause()).toContain(`Rp${fee.toLocaleString("id-ID")}`);
+    // the rule really charges that amount for a tenant 8 days late
+    const run = ws.run("run_contract_fee");
+    const out = await rentTick(run, [{ id: "K05", room: "5", due: "2026-12-01", paid: false, tenure_months: 3 }], "2026-12-09", { execute: async () => ({ ok: true, via: "log" }) });
+    expect(out[0]).toMatchObject({ action: "charge_fee", amount: fee });
+  });
+
+  it("states the same due day as the live bills, and counts the fee from it (SOP: bills go out on the 1st, fee at H+7)", async () => {
+    const { deps, rail, ws } = await testDeps();
+    const crew = new KamarKosong(deps, newState(playbookB()));
+    await crew.approveB(DEMO_PASSKEY);
+    await crew.prospectMessage("p4", "Rina", "11", "jadwal survei kapan?");
+    await crew.viewingDone("p4", true);
+    await rail.simulatePayment(crew.prospects.p4!.invoice!.id);
+    const contract = await crew.depositPaid("p4");
+    const day = Number(contract.text.match(/jatuh tempo setiap tanggal (\d+)/)?.[1]);
+    expect(day).toBe(KOS_DUE_DAY);
+    expect(contract.text).not.toContain("tanggal 5");
+    expect(contract.text).toContain(`Belum lunas pada H+${KOS_RENT_CARDS.late_fee.days_after_due} sesudah jatuh tempo`);
+    // the live bills (the seed's and the month roll's) are due on that same day
+    const now = Date.parse("2026-12-04T01:00:00Z");
+    const store = { data: {} as object, save() {} };
+    const seeded = saveBillBook(store.data, demoBills(dueDateWib(now)), now);
+    expect(seeded.bills.every((b) => Number(b.due.slice(8)) === day)).toBe(true);
+    const ladder = new Ladder(ws);
+    await liveTick({ ws, store, ladder, outbox: new Outbox(ws, store, ladder), execute: async () => ({ ok: true, via: "log" }), now: () => Date.parse("2027-01-04T01:00:00Z") });
+    const rolled = loadBillBook(store.data)!;
+    expect(rolled.period).toBe("2027-01");
+    expect(rolled.bills.every((b) => Number(b.due.slice(8)) === day)).toBe(true);
   });
 
   it("stops itself when the target is reached", async () => {
