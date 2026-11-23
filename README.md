@@ -103,7 +103,7 @@ Where Meko Cloud differs from local Meko (all handled in `packages/meko`, checke
 npm run dev
 ```
 
-Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/api/meko/public/report.html`. Add `--llm` to let Claude Haiku 5.5 word the drafts (needs `ANTHROPIC_API_KEY`). For Meko Cloud set `MEKO_API_KEY` (and optionally `MEKO_MCP_URL`) in `.env`; without it the local Meko and `meko token` are used. `REEVE_MEKO_PUBLIC_ASK=on` opens `POST /api/meko/public/ask`.
+Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/api/meko/public/report.html`. Add `--llm` to let Claude Haiku 5.5 word the drafts (needs `ANTHROPIC_API_KEY`). For Meko Cloud set `MEKO_API_KEY` (and optionally `MEKO_MCP_URL`) in `.env`; without it the local Meko and `meko token` are used. `REEVE_MEKO_PUBLIC_ASK=on` opens `POST /api/meko/public/ask`. Questions outside the fixed patterns ("kenapa saya didenda?", "kenapa kamar 3 boleh telat?", "siapa yang sering telat?") are answered by Claude Haiku 5.5 when `ANTHROPIC_API_KEY` is set: it sees only the decisions that asker may see (a tenant sees only their own), must cite the receipts it used, and an answer that cites none is dropped for the template reply. `REEVE_ASK_LLM=off` turns it off, `REEVE_ASK_MODEL` picks another model, and `REEVE_ASK_LLM_DAILY` (default 200) caps model calls per day, since the public route has no login.
 
 ### Live billing tick (`POST /api/meko/tick`)
 
