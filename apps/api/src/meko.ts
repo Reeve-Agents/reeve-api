@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, buildDigest, liveTick, markBillPaid, type MarkPaidResult, NoBills, type TickReport, UnknownBill, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, liveTick, markBillPaid, type MarkPaidResult, NoBills, type TickReport, UnknownBill, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, type AskLlm, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -15,6 +15,8 @@ export interface MekoAppDeps {
   endpoint: { url: string; cloud: boolean };
   /** POST /ask writes an "explain" decision; off unless the deployment turns it on. */
   allowAsk?: boolean;
+  /** Words answers to questions outside the ask patterns (Haiku by default); without it they get the template reply. */
+  askLlm?: AskLlm;
   /** Anchor calldata encoder (@reeve/anchor), shown on the shared verify page. */
   encodeAnchor?: (root: string, leaves: number) => string;
   /** Where the web app shows one decision. */
@@ -102,7 +104,7 @@ export function createMekoApp(deps: MekoAppDeps, open = mekoOpener(deps)) {
     const body = (await c.req.json().catch(() => ({}))) as { question?: string; role?: string; subject?: string };
     const role = body.role === "staff" || body.role === "owner" ? body.role : "tenant";
     if (!body.question || body.question.length > 300) return c.json({ error: "Tulis pertanyaan (maks. 300 karakter)." }, 400);
-    const answer = await new AskBusiness(await open(), explainUrl).ask(body.question, { role, subject: body.subject?.slice(0, 8) });
+    const answer = await new AskBusiness(await open(), explainUrl, deps.askLlm).ask(body.question, { role, subject: body.subject?.slice(0, 8) });
     return c.json(answer);
   });
 

@@ -8,6 +8,7 @@ import { connectorsFromEnv, inferFields } from "@reeve/connectors";
 import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
+import { askLlmFromEnv } from "./ask-llm";
 import { createApp } from "./app";
 import { createMekoApp, createMekoOwnerApp, createMekoTickApp, mekoOpener } from "./meko";
 import { digestSenderFromEnv, liveExecutor, loadBillBook, wibDate } from "@reeve/crew";
@@ -55,12 +56,17 @@ const scheduler = schedulerFromEnv();
 const mekoWorkspace = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
 const mekoEndpoint = mekoEndpointFromEnv();
 const mekoStore = await persistence.openWorkspace(`meko-${mekoWorkspace}`);
+// "Tanya usaha" questions outside the fixed patterns (REEVE_ASK_LLM=on): Haiku words an answer that
+// must cite receipts. The public route and the chats each have their own daily cap.
+const askLlmPublic = askLlmFromEnv(providers, "public");
+const askLlmChat = askLlmFromEnv(providers, "chat");
 const mekoDeps = {
   workspace: mekoWorkspace,
   ledger: mekoStore.ledger,
   connect: () => connectMeko(mekoEndpoint),
   endpoint: mekoEndpoint,
   allowAsk: process.env.REEVE_MEKO_PUBLIC_ASK === "on",
+  askLlm: askLlmPublic,
   encodeAnchor: (root: string, leaves: number) => encodeAnchor(root, leaves),
 };
 const mekoOpen = mekoOpener(mekoDeps);
@@ -68,7 +74,7 @@ const mekoApp = createMekoApp(mekoDeps, mekoOpen);
 // Tenants ask "kenapa saya didenda?" on Telegram (same bot webhook and secret as the workspaces).
 // With TELEGRAM_BOT_TOKEN the bot can also write first, so a tenant's chat id is kept for the live billing tick.
 const botToken = process.env.TELEGRAM_BOT_TOKEN || undefined;
-const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, keepChatIds: !!botToken, digest: () => mekoOwner.digestText() });
+const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, keepChatIds: !!botToken, digest: () => mekoOwner.digestText(), askLlm: askLlmChat });
 // Owner actions on that workspace (SOP Discovery), behind the session at /api/meko/owner/*.
 const mekoOwner = createMekoOwnerApp(
   {

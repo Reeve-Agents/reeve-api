@@ -7,7 +7,7 @@
 // the chat id itself also kept, per pseudonym, in `meko_links.push`; without it only an HMAC is.
 // WhatsApp stays a wa.me link the owner opens and sends themselves.
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { AskBusiness } from "@reeve/crew";
+import { type AskLlm, AskBusiness } from "@reeve/crew";
 import type { MekoWorkspace } from "@reeve/meko";
 import type { Store } from "./store";
 
@@ -32,6 +32,8 @@ export interface MekoTelegramDeps {
   /** The owner's daily digest text (built by code from the ledger); sent as the reply to /ringkasan. */
   digest?: () => Promise<string> | string;
   now?: () => number;
+  /** Words answers to questions outside the ask patterns; without it they get the template reply. */
+  askLlm?: AskLlm;
 }
 
 const SUBJECT = /^K\d{2,3}$/;
@@ -47,7 +49,7 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
   };
   const chatKey = (chat: string | number) => createHmac("sha256", deps.secret ?? "reeve").update(String(chat)).digest("hex").slice(0, 32);
   const proofUrl = (r: string) => `${deps.webOrigin.replace(/\/$/, "")}/?view=jejak&receipt=${r}`;
-  const ask = async () => new AskBusiness(await deps.open(), proofUrl);
+  const ask = async () => new AskBusiness(await deps.open(), proofUrl, deps.askLlm);
 
   /** Owner: a one-time code (24 h) that links one tenant's Telegram chat to their pseudonym. */
   function createLink(subject: string): { code: string; url: string | null; expires: string } {
