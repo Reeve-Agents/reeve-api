@@ -19,3 +19,4 @@ export * from "./groupbuy";
 export * from "./amend";
 export * from "./outbox";
 export * from "./digest";
+export * from "./weak";

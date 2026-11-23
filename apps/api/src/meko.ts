@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, buildDigest, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -271,6 +271,17 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
   app.post("/telegram/owner-link", (c) => {
     if (!deps.telegram?.createOwnerLink) return c.json({ error: "Telegram belum diatur di server ini (TELEGRAM_WEBHOOK_SECRET)." }, 409);
     return c.json(deps.telegram.createOwnerLink());
+  });
+
+  app.get("/weak", async (c) => c.json(await weakSearches(await open())));
+  app.post("/weak/verify", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { log_id?: string };
+    if (!body.log_id || typeof body.log_id !== "string") return c.json({ error: "log_id wajib" }, 400);
+    try {
+      return c.json(await verifyWeak(await open(), body.log_id));
+    } catch (e) {
+      return c.json({ error: `Cek ulang gagal: ${String(e).slice(0, 120)}` }, 409);
+    }
   });
 
   app.get("/review", (c) => {

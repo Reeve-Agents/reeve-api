@@ -2,6 +2,7 @@
 // audit-log export is a Pro feature). Every line is a recorded decision with its rule, approval,
 // exception check, verification result and anchor. Stored as a Meko artifact by SHA-256.
 import type { AnchorBody, DecisionBody, LedgerEntry } from "@reeve/receipts";
+import { weakSearches, type WeakSearches } from "./weak";
 import { anchorProof, type MekoMessage, type MekoWorkspace, traceBodyOf, traceHash } from "@reeve/meko";
 
 export interface RaporEntry {
@@ -45,8 +46,36 @@ export interface Rapor {
     explanations: number;
   };
   tokens: { llm_input: number; llm_output: number; context_tokens_saved: number; lookups: number; worker_calls: number };
+  /** Input-token saving vs sending the whole history every time, computed from Reeve's own records (same on local and Cloud). */
+  savings: TokenSavings;
+  /** Searches Meko Cloud scored as weak; empty on local Meko. */
+  weak: WeakSearches;
   anchors: { seq: number; at: string; merkle_root: string; leaves: number; anchor: string; tx?: string; explorer?: string }[];
   decisions: RaporEntry[];
+}
+
+/** Measured once in `npm run bench:tokens` (Haiku 5.5, 10 runs, 49 events): the full-context baseline sent 105,407 input tokens for 49 events. */
+export const BASELINE_INPUT_PER_EVENT = Math.round(105407 / 49);
+
+export interface TokenSavings {
+  source: "reeve-ledger";
+  /** Decisions of the Operator, each one comparable to a benchmark event. */
+  events: number;
+  baseline_input: number;
+  reeve_input: number;
+  saved: number;
+  /** baseline / Reeve, null when Reeve sent nothing. */
+  ratio: number | null;
+  /** "billed": usage recorded on the decision; "estimated": 4 characters per token over the input and what the agent looked up. */
+  reeve_input_basis: { billed: number; estimated: number };
+  baseline_per_event: number;
+  note: string;
+}
+
+/** What Reeve sent to a model for one decision: the billed input if recorded, else the prompt it would have built (input + lookups, 4 chars per token). */
+function sentTokens(e: RaporEntry, seenChars: number): { n: number; billed: boolean } {
+  if (e.usage) return { n: e.usage.input_tokens, billed: true };
+  return { n: Math.ceil((e.input.length + seenChars) / 4), billed: false };
 }
 
 const RULE = /\b(R\d{1,2}\b|b\d_[a-z_]+|c\d_[a-z_]+|bound_[a-z_]+)/;
@@ -58,12 +87,14 @@ export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: 
   const decisions = ws.decisions().filter((d) => d.at.slice(0, 10) >= from && d.at.slice(0, 10) <= to);
   const cache = new Map<string, MekoMessage[]>();
   const out: RaporEntry[] = [];
+  const seen = new Map<string, number>();
   for (const d of decisions) {
     const key = `${d.agent}:${d.conversation_id}`;
     if (!cache.has(key)) cache.set(key, (await ws.conversation(d.agent, d.conversation_id).catch(() => ({ messages: [] as MekoMessage[] }))).messages);
     const m = cache.get(key)!.find((x) => x.metadata?.reeve_receipt === d.entry_hash);
     const verified = !!m && traceHash(traceBodyOf(d, m)) === d.trace_hash;
     const usage = m?.metadata?.reeve_usage as RaporEntry["usage"] | undefined;
+    seen.set(d.entry_hash, ((m?.metadata?.reeve_seen as { memory?: { text?: string }[] }[]) ?? []).reduce((n, l) => n + (l.memory ?? []).reduce((k, x) => k + (x.text?.length ?? 0), 0), 0));
     out.push({
       seq: d.seq,
       at: d.at,
@@ -116,8 +147,35 @@ export async function buildRapor(ws: MekoWorkspace, opts: { from?: string; to?: 
       lookups: out.reduce((s, e) => s + e.looked_up, 0),
       worker_calls: count((e) => e.agent === "worker"),
     },
+    savings: tokenSavings(out, seen),
+    weak: await weakSearches(ws),
     anchors,
     decisions: out,
+  };
+}
+
+export function tokenSavings(out: RaporEntry[], seen: Map<string, number>): TokenSavings {
+  const ops = out.filter((e) => e.agent === "operator");
+  let reeve = 0;
+  let billed = 0;
+  let estimated = 0;
+  for (const e of ops) {
+    const s = sentTokens(e, seen.get(e.receipt) ?? 0);
+    reeve += s.n;
+    if (s.billed) billed += s.n;
+    else estimated += s.n;
+  }
+  const baseline = ops.length * BASELINE_INPUT_PER_EVENT;
+  return {
+    source: "reeve-ledger",
+    events: ops.length,
+    baseline_input: baseline,
+    reeve_input: reeve,
+    saved: Math.max(0, baseline - reeve),
+    ratio: reeve > 0 ? Math.round((baseline / reeve) * 10) / 10 : null,
+    reeve_input_basis: { billed, estimated },
+    baseline_per_event: BASELINE_INPUT_PER_EVENT,
+    note: "Baseline = full SOP and history in every call, measured in the token benchmark (about " + BASELINE_INPUT_PER_EVENT + " input tokens per event). Reeve side = billed input where recorded, otherwise an estimate of 4 characters per token. Computed from Reeve's ledger and traces, so it is the same on local Meko and Meko Cloud.",
   };
 }
 
@@ -170,7 +228,7 @@ export function raporHtml(r: Rapor, opts: { explainUrl?: (receipt: string) => st
     ["Chat dari konten", "Chats from content", String(u.chats_from_content)],
     ["Balasan otomatis", "Automatic replies", String(u.replies_auto)],
     ["Diteruskan ke pemilik", "Sent to owner", String(u.escalations)],
-    ["Token konteks dihemat", "Context tokens saved", r.tokens.context_tokens_saved.toLocaleString("id-ID")],
+    ["Hemat token input vs konteks penuh", "Input tokens saved vs full context", `${r.savings.saved.toLocaleString("id-ID")}${r.savings.ratio ? ` (${r.savings.ratio}×)` : ""}`],
     ["Panggilan Worker", "Worker calls", String(r.tokens.worker_calls)],
   ];
   const rows = r.decisions
@@ -208,6 +266,10 @@ html[data-lang=id] [data-l=en],html[data-lang=en] [data-l=id]{display:none}
 <h2>${t("Keputusan", "Decisions")}</h2>
 <div class="wrap"><table><thead><tr><th>${t("Waktu", "Time")}</th><th>${t("Agen", "Agent")}</th><th>${t("Tindakan", "Action")}</th><th>${t("Untuk", "About")}</th><th>${t("Aturan", "Rule")}</th><th>${t("Alasan (dari jejak)", "Reasoning (from trace)")}</th><th>${t("Cek", "Check")}</th><th>Receipt</th></tr></thead><tbody>${rows}</tbody></table></div>
 <h2>Anchor</h2><ul>${anchors}</ul>
+<h2>${t("Pencarian lemah", "Weak searches")}</h2>
+${r.weak.items.length ? `<p class="mute">${t("Pencarian yang menurut Meko Cloud menemukan sedikit atau tidak ada. Kolom terakhir: hasil cek ulang setelah memori ditambah (selflearning_verify), kosong jika belum dicek.", "Searches Meko Cloud scored as finding little or nothing. Last column: result of the re-check after a memory was added (selflearning_verify), empty if not checked yet.")} ${r.weak.quality_pct !== undefined ? `${t("Kualitas pencarian", "Search quality")}: ${r.weak.quality_pct}% (${r.weak.searches} ${t("pencarian", "searches")}).` : ""}</p><div class="wrap"><table><thead><tr><th>${t("Pencarian", "Search")}</th><th>×</th><th>${t("Alasan", "Reason")}</th><th>${t("Status", "State")}</th><th>${t("Cek ulang", "Re-check")}</th></tr></thead><tbody>${r.weak.items.slice(0, 15).map((w) => `<tr><td class="why">${esc(w.query.slice(0, 160))}</td><td>${w.count}</td><td>${esc(w.reason)}</td><td>${esc(w.state)}</td><td>${esc(w.replay_band ?? "")}</td></tr>`).join("")}</tbody></table></div>` : ""}
+<p class="mute">${esc(r.weak.note)}</p>
 <p class="mute">${t("Nama penghuni tidak pernah dikirim ke AI atau ke Meko; yang tampil adalah nama samaran.", "Tenant names are never sent to an AI model or to Meko; only pseudonyms appear.")} ${t("Metrik konten di demo ini simulasi.", "Content metrics in this demo are simulated.")}</p>
+<p class="mute">${t("Hemat token dihitung dari catatan Reeve sendiri (sumber: ledger dan jejak), bukan dari Meko: pembanding 'konteks penuh' ≈", "Token saving is computed from Reeve's own records (source: ledger and traces), not from Meko: the full-context baseline is ≈")} ${r.savings.baseline_per_event.toLocaleString("id-ID")} ${t("token input per kejadian (hasil bench:tokens);", "input tokens per event (bench:tokens result);")} ${t("sisi Reeve", "Reeve side")} ${r.savings.reeve_input_basis.billed.toLocaleString("id-ID")} ${t("tertagih", "billed")} + ${r.savings.reeve_input_basis.estimated.toLocaleString("id-ID")} ${t("perkiraan (4 karakter/token).", "estimated (4 chars/token).")}</p>
 </main><script>document.documentElement.dataset.lang=new URLSearchParams(location.search).get("lang")==="en"?"en":"id"</script></body></html>`;
 }

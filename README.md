@@ -85,7 +85,7 @@ Where Meko Cloud differs from local Meko (all handled in `packages/meko`, checke
 - **Promoted memories** are in the knowledge base, but `context_search` sometimes skips that source; Reeve asks `knowledgebase_search` when it comes back empty, and waits for a new owner exception to be searchable before the Operator acts on it.
 - **Cloud distils facts from traces** ("K05 is 10 days late") into memories. An owner exception now counts only in the owner's wording ("boleh telat"), so a distilled fact can never become a permission.
 - **Conversations are permanent and deduplicated by session id**, so every seed gets a fresh run id. `--fresh` cannot wipe a Cloud datapack.
-- `track_token_usage` works (`recorded: true`); `datapack_metrics` does not exist on Cloud.
+- `track_token_usage` works (`recorded: true`); `datapack_metrics` does not exist on Cloud, so the Rapor computes its token saving from Reeve's own ledger and traces (same on local and Cloud, source named in the report). Meko Cloud's `selflearning_*` tools feed a read-only "Pencarian lemah" section in the Rapor (`GET /api/meko/owner/weak`).
 
 ```bash
 npm run dev

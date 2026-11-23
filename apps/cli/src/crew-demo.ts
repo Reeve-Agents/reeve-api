@@ -249,6 +249,7 @@ const metrics = (await meko.call("datapack_metrics", { conversation_id: ws.setup
 say(`\n${all.length} traced decisions, ${ok} verified against Meko; ${logged.length} connector calls logged (not sent)`);
 say(`rapor artifact ${stored.content_hash.slice(0, 16)}… -> ${join(dir, "rapor.html")}`);
 if (metrics?.context_efficiency) say(`context_search: ${metrics.searches} searches, ${metrics.context_efficiency.tokens_sent} tokens sent, ${metrics.context_efficiency.tokens_saved} saved (${metrics.context_efficiency.saved_pct}%)`);
+say(`input saved vs full context (Reeve ledger, ${rapor.savings.events} Operator events): ${rapor.savings.saved} of ${rapor.savings.baseline_input} baseline tokens${rapor.savings.ratio ? ` (${rapor.savings.ratio}x)` : ""}; Reeve side ${rapor.savings.reeve_input_basis.billed} billed + ${rapor.savings.reeve_input_basis.estimated} estimated`);
 say(`LLM tokens: ${rapor.tokens.llm_input} in / ${rapor.tokens.llm_output} out over ${rapor.tokens.worker_calls} Worker calls`);
 await meko.close();
 await persistence?.close();
