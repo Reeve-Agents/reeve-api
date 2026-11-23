@@ -14,8 +14,12 @@ export interface AskAnswer {
   model?: string;
 }
 
-/** Words a grounded answer for a question the patterns do not cover. Same shape as the Worker. */
-export type AskLlm = WorkerFn;
+/**
+ * Words a grounded answer for a question the patterns do not cover. Same shape as the Worker; it
+ * may throw an error carrying `usage` (tokens spent on an unusable reply) and may say how many
+ * calls are left today, so the ask agent skips the Meko fetches once the cap is reached.
+ */
+export type AskLlm = WorkerFn & { remaining?: () => number };
 
 /** At most this many records go to the model, from at most this many Meko conversations. */
 const MAX_RECORDS = 12;
@@ -32,6 +36,7 @@ export const ASK_SYSTEM = [
   "Answer in plain Indonesian, in at most 4 short sentences.",
   "Use only facts that are in the records. Do not guess amounts, dates, names or reasons.",
   "After each claim, put the tag of the record it comes from, for example [R2].",
+  "Use only numbers, amounts, dates and room codes that are written in the records you cite. Do not compute new ones.",
   "You can only explain. Never promise, offer or perform an action.",
   `If the records do not answer the question, reply with exactly: ${NO_ANSWER}`,
 ].join("\n");
@@ -40,6 +45,57 @@ const STOP = new Set(["apa", "yang", "kenapa", "mengapa", "bagaimana", "gimana",
 
 function words(s: string): string[] {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").split(" ").filter((w) => w.length >= 3 && !STOP.has(w));
+}
+
+// Capitalised words that are not names, kept when the question is masked for the model.
+const KEEP = new Set([
+  ...STOP, "apakah", "berapa", "kenapa", "mengapa", "kamar", "kos", "melati", "reeve", "rp", "sop", "bulan", "hari", "denda", "tagihan", "sewa", "pemilik", "penghuni", "pak", "bu", "ibu", "bapak", "mas", "mbak",
+  "januari", "februari", "maret", "april", "mei", "juni", "juli", "agustus", "september", "oktober", "november", "desember",
+  "senin", "selasa", "rabu", "kamis", "jumat", "sabtu", "minggu", "telegram", "whatsapp", "qris",
+]);
+
+/**
+ * The API's workspace has no alias map, so names in a question would reach the model as typed.
+ * Every capitalised word that is not a known word or a K05/P1 code becomes "[nama]".
+ */
+export function maskNames(q: string): string {
+  return q.replace(/\p{Lu}[\p{L}'-]{1,}/gu, (w) => (KEEP.has(w.toLowerCase()) || /^[KP]\d+$/.test(w) ? w : "[nama]"));
+}
+
+/** Numbers in a text, normalised so "Rp75.000", "75000" and "75,000" match, and "2026-12-01" gives 2026, 12, 1. */
+export function numbersIn(s: string): string[] {
+  return (s.match(/\d[\d.,]*/g) ?? []).flatMap((tok) => {
+    const t = tok.replace(/[.,]+$/, "");
+    if (/^\d{1,3}([.,]\d{3})+$/.test(t)) return [t.replace(/[.,]/g, "")];
+    return t.split(/[.,]/).filter(Boolean).map((x) => String(Number(x)));
+  });
+}
+
+const TAG = /\[\s*([Rr]\s*\d+(?:\s*(?:[,;]|[-\u2013]|dan)\s*[Rr]?\s*\d+)*)\s*\]/g;
+
+/** "R1, R3" -> [1, 3]; "R1-R3" -> [1, 2, 3]. */
+function tagNumbers(group: string): number[] {
+  const out: number[] = [];
+  for (const m of group.matchAll(/(\d+)\s*[-\u2013]\s*[Rr]?\s*(\d+)|(\d+)/g)) {
+    if (m[3]) out.push(Number(m[3]));
+    else for (let n = Number(m[1]); n <= Number(m[2]) && out.length < 50; n++) out.push(n);
+  }
+  return out;
+}
+
+/** Sentences of an answer with the tags each one carries; a tag group that opens a sentence belongs to the one before. */
+function sentences(raw: string): { text: string; tags: number[] }[] {
+  const out: { text: string; tags: number[] }[] = [];
+  for (const piece of raw.split(/(?<=[.!?])\s+/)) {
+    const lead = piece.match(/^((?:\s*\[[^\]]*\])+)\s*/);
+    if (lead && out.length) {
+      out.at(-1)!.tags.push(...[...lead[1]!.matchAll(TAG)].flatMap((m) => tagNumbers(m[1]!)));
+      const rest = piece.slice(lead[0].length);
+      if (!rest) continue;
+      out.push({ text: rest, tags: [...rest.matchAll(TAG)].flatMap((m) => tagNumbers(m[1]!)) });
+    } else out.push({ text: piece, tags: [...piece.matchAll(TAG)].flatMap((m) => tagNumbers(m[1]!)) });
+  }
+  return out;
 }
 
 const clip = (s: string | undefined) => (s && s.length > CLIP ? `${s.slice(0, CLIP)}...` : (s ?? ""));
@@ -86,6 +142,7 @@ export class AskBusiness {
   private async open(question: string, who: Asker, lookup: Lookup, room: string | undefined): Promise<OpenResult> {
     const llm = this.llm;
     if (!llm) return { proofs: [], shown: 0, note: "no LLM configured" };
+    if (llm.remaining && llm.remaining() <= 0) return { proofs: [], shown: 0, note: "the daily LLM cap is reached" };
     const visible = this.ws
       .decisions()
       .filter((d) => d.agent !== "ask" && (who.role !== "tenant" || (!!who.subject && d.subject === who.subject)))
@@ -103,8 +160,8 @@ export class AskBusiness {
         const m = byReceipt.get(d.entry_hash);
         if (!m) return null;
         const body = `${d.action ?? ""} ${d.action_class ?? ""} ${d.subject ?? ""} ${m.input} ${m.output} ${m.reasoning ?? ""}`;
-        let score = words(body).filter((w) => q.has(w)).length;
-        if (room && (d.subject === roomSubject || m.input.toLowerCase().includes(`kamar ${room}`))) score += 5;
+        let score = [...new Set(words(body))].filter((w) => q.has(w)).length;
+        if (room && (d.subject === roomSubject || new RegExp(`kamar ${room}\\b`, "i").test(m.input))) score += 5;
         return { d, m, score, recency };
       })
       .filter((x) => x !== null)
@@ -125,7 +182,7 @@ export class AskBusiness {
     const notes = who.role === "tenant" ? [] : lookup.memory.slice(0, 5).map((n) => `- ${clip(n.text)}`);
     const user = [
       `Penanya: ${who.role}${who.subject ? ` ${who.subject}` : ""}`,
-      `Pertanyaan: ${this.ws.pseudonyms.redact(question)}`,
+      `Pertanyaan: ${maskNames(this.ws.pseudonyms.redact(question))}`,
       ...(notes.length ? ["", "Catatan bersama:", ...notes] : []),
       "",
       "Catatan keputusan:",
@@ -135,25 +192,40 @@ export class AskBusiness {
     try {
       res = await llm(ASK_SYSTEM, user);
     } catch (err) {
-      return { proofs: [], shown: ranked.length, note: `LLM call failed (${err instanceof Error ? err.name : "error"})` };
+      const usage = (err as { usage?: TokenUsage } | undefined)?.usage;
+      return { proofs: [], usage, shown: ranked.length, note: `LLM call failed (${err instanceof Error ? err.name : "error"})` };
     }
+    const shown = ranked.length;
+    const drop = (note: string): OpenResult => ({ proofs: [], usage: res.usage, shown, note });
     const raw = res.text.trim();
-    if (raw === "" || raw.startsWith(NO_ANSWER)) return { proofs: [], usage: res.usage, shown: ranked.length, note: "the model found no answer in the records" };
-    const cited: number[] = [];
-    const text = raw
-      .replace(/\[\s*(R\d+(?:\s*[,;]\s*R\d+)*)\s*\]/g, (_, tags: string) => {
-        for (const t of tags.match(/\d+/g) ?? []) {
-          const n = Number(t);
-          if (n >= 1 && n <= ranked.length && !cited.includes(n)) cited.push(n);
-        }
-        return "";
-      })
+    const parts = sentences(raw);
+    const all = parts.flatMap((p) => p.tags);
+    if (raw === "" || (raw.includes(NO_ANSWER) && all.length === 0)) return drop("the model found no answer in the records");
+    if (all.length === 0) return drop("the answer cited no record, so it was dropped");
+    if (all.some((n) => n < 1 || n > shown)) return drop("the answer cited a record it was not shown, so it was dropped");
+    // Grounding: every number and room code in a sentence must be in the question or in the records that sentence cites.
+    const recordText = (n: number) => { const { d, m } = ranked[n - 1]!; return `${d.subject ?? ""} ${m.input} ${m.output} ${m.reasoning ?? ""}`; };
+    const asked = new Set([...numbersIn(question), ...(question.match(/\bK\d{2,3}\b/g) ?? []), ...(who.subject ? [who.subject] : [])]);
+    for (const p of parts) {
+      const plain = p.text.replace(TAG, "");
+      const facts = [...numbersIn(plain), ...(plain.match(/\bK\d{2,3}\b/g) ?? [])].filter((f) => !asked.has(f));
+      if (facts.length === 0) continue;
+      if (p.tags.length === 0) return drop("a sentence with numbers cited no record, so the answer was dropped");
+      const src = p.tags.map(recordText).join(" ");
+      const known = new Set([...numbersIn(src), ...(src.match(/\bK\d{2,3}\b/g) ?? [])]);
+      const missing = facts.find((f) => !known.has(f));
+      if (missing) return drop(`the answer states ${missing}, which its cited records do not contain, so it was dropped`);
+    }
+    const cited = [...new Set(all)];
+    const text = this.ws.pseudonyms
+      .redact(raw.replace(TAG, "").replace(/https?:\/\/\S+/g, ""))
       .replace(/[ \t]+([.,;:!?])/g, "$1")
       .replace(/[ \t]{2,}/g, " ")
+      // After the grounding check: the model copies amounts as written in the records ("Rp75000").
+      .replace(/Rp\s?(\d{4,})\b/g, (_, n: string) => rp(Number(n)))
       .trim();
-    if (cited.length === 0) return { proofs: [], usage: res.usage, shown: ranked.length, note: "the answer cited no record, so it was dropped" };
     const proofs = cited.map((n) => ranked[n - 1]!.d.entry_hash).map((r) => ({ receipt: r, url: this.proofUrl(r) }));
-    return { text, proofs, usage: res.usage, shown: ranked.length, note: "" };
+    return { text: `${text}\n(Jawaban ini disusun AI dari catatan yang dikutip.)`, proofs, usage: res.usage, shown, note: "" };
   }
 
   private async message(d: LedgerEntry & DecisionBody): Promise<MekoMessage | undefined> {
@@ -221,7 +293,7 @@ export class AskBusiness {
       output: { kind: answered, answer: text, proofs: proofs.map((p) => p.receipt), ...(answered === "open" ? { answered_by: open?.usage?.model ?? "llm" } : {}) },
       reasoning:
         answered === "open"
-          ? `Read-only answer of kind open: ${open?.usage?.model ?? "an LLM"} worded it from ${open?.shown} recorded decision(s) this asker may see, and it cites ${proofs.length} of them; each citation was checked against the ledger. This agent has no tools that act.`
+          ? `Read-only answer of kind open: ${open?.usage?.model ?? "an LLM"} worded it from ${open?.shown} recorded decision(s) this asker may see, and it cites ${proofs.length} of them. Code checked that every tag points at a record the model was shown and that every number and room code in the answer appears in the question or in the records its sentence cites; it did not check the wording. This agent has no tools that act.`
           : `Read-only answer of kind ${kind}, built from ${proofs.length} recorded decision(s)${open ? `; no LLM answer used: ${open.note}` : ""}; this agent has no tools that act.`,
       action: "explain",
       action_class: "ask",
