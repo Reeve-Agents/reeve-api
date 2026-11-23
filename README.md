@@ -69,6 +69,8 @@ flowchart LR
   - Metrics only. Revocable; whether a link is live is read from the ledger.
   - The page recomputes every ledger hash and anchor Merkle root in the browser.
 
+**Viewing bookings (Playbook B, step `b3_viewing`).** The viewing is a real Google Calendar event through Composio when the owner's calendar is connected: in Composio Connect, connect Google Calendar for the account behind `COMPOSIO_API_KEY`. The event goes on the primary calendar in Asia/Jakarta, with the pseudonym in the title and no attendees or invitation. Without that key or connection, the viewing is recorded on the Log connector (not booked) and the decision says so. If Composio rejects the event, the decision says it failed, the slot is not held and the owner gets a review item. Playbooks still run only in the seed (`npm run crew:demo`; there is no API runner yet), and the seed books real events when Calendar is connected; `-- --no-calendar` keeps viewings on the Log.
+
 ### Run it
 
 ```bash
@@ -137,7 +139,7 @@ Rules it follows: the **autonomy ladder** decides. While "Pengingat" is at `ask`
 | Model calls | 6 of 79 turns, all wording drafts; no model call decides whether to act |
 | `context_search` | 26 searches before acting |
 
-Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected, except Telegram reminders from the live billing tick when `TELEGRAM_BOT_TOKEN` is set; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
+Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Google Calendar are connected, except viewings (a real Google Calendar event through Composio once Calendar is connected) and Telegram reminders from the live billing tick when `TELEGRAM_BOT_TOKEN` is set; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
 
 ### Gotong Royong: shared learning across businesses (`npm run gotong:demo`)
 
