@@ -46,7 +46,19 @@ ${COMMON}
 - When a field lists its values, compare with exactly those words, and use the field that holds them.
 - Describe the data: the entity, its key field, every field you use with its type, and where the records live.`;
 
+/** The shared-learning block appended to a pack's prompt; empty when there are no hints, so the prompt is then byte-for-byte what it was. */
+export function sharedHintsBlock(hints: SopHints = {}): string {
+  const list = (hints.sharedHints ?? []).map((h) => h.trim()).filter(Boolean);
+  if (!list.length) return "";
+  return `\n\nPatterns learned from other businesses' first drafts (anonymous, advisory; the SOP above all):\n${list.map((h) => `- ${h}`).join("\n")}`;
+}
+
 export function packSchema(pack: PackId, hints: SopHints = {}): PackSchema {
+  const base = packSchemaBase(pack, hints);
+  return { ...base, system: base.system + sharedHintsBlock(hints) };
+}
+
+function packSchemaBase(pack: PackId, hints: SopHints = {}): PackSchema {
   if (pack === "generic") {
     const fields = hints.fields?.length ? `\n\nThe owner's records have these fields (names and types only):\n${hints.fields.map((f) => `- ${f.name} (${f.type})${f.values ? `: one of ${f.values.map((v) => JSON.stringify(v)).join(", ")}` : ""}`).join("\n")}` : "";
     const connectors = hints.connectors?.length ? `\n\nConnected services: ${hints.connectors.join(", ")}.` : "";

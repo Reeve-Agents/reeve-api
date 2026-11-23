@@ -1,0 +1,7 @@
+[
+  { "day": 2, "key": "L01", "field": "pay_status", "value": "lunas" },
+  { "day": 3, "key": "L04", "field": "laundry_status", "value": "selesai" },
+  { "day": 5, "key": "L09", "field": "laundry_status", "value": "selesai" },
+  { "day": 8, "key": "L03", "field": "pay_status", "value": "lunas" },
+  { "day": 4, "key": "L02", "field": "kilo_left", "value": 12 }
+]

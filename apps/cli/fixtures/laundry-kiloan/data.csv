@@ -1,0 +1,13 @@
+id,name,email,telegram_chat_id,bill,done_date,laundry_status,pay_status,kilo_left,blocked
+L01,Pelanggan A,a@example.com,910000001,85000,2026-10-30,selesai,belum,10,tidak
+L02,Pelanggan B,b@example.com,910000002,120000,2026-11-01,selesai,lunas,4,tidak
+L03,Pelanggan C,c@example.com,910000003,450000,2026-10-28,selesai,belum,2,tidak
+L04,Pelanggan D,d@example.com,910000004,60000,2026-11-04,proses,belum,8,tidak
+L05,Pelanggan E,e@example.com,910000005,95000,2026-10-31,selesai,belum,1,ya
+L06,Pelanggan F,f@example.com,910000006,700000,2026-11-02,selesai,belum,15,tidak
+L07,Pelanggan G,g@example.com,910000007,40000,2026-11-06,proses,lunas,2,tidak
+L08,Pelanggan H,h@example.com,910000008,210000,2026-10-25,selesai,belum,6,tidak
+L09,Pelanggan I,i@example.com,910000009,150000,2026-11-08,proses,belum,0,tidak
+L10,Pelanggan J,j@example.com,910000010,380000,2026-11-03,selesai,belum,3,tidak
+L11,Pelanggan K,k@example.com,910000011,90000,2026-11-10,proses,lunas,9,tidak
+L12,Pelanggan L,l@example.com,910000012,520000,2026-11-05,selesai,belum,12,tidak

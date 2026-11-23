@@ -10,6 +10,7 @@ import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
 import { createMekoApp, createMekoOwnerApp, mekoOpener } from "./meko";
+import { digestSenderFromEnv } from "@reeve/crew";
 import { mekoTelegram } from "./meko-telegram";
 import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
 import { schedulerFromEnv } from "./scheduler";
@@ -64,7 +65,7 @@ const mekoDeps = {
 const mekoOpen = mekoOpener(mekoDeps);
 const mekoApp = createMekoApp(mekoDeps, mekoOpen);
 // Tenants ask "kenapa saya didenda?" on Telegram (same bot webhook and secret as the workspaces).
-const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined });
+const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, digest: () => mekoOwner.digestText() });
 // Owner actions on that workspace (SOP Discovery), behind the session at /api/meko/owner/*.
 const mekoOwner = createMekoOwnerApp(
   {
@@ -75,7 +76,10 @@ const mekoOwner = createMekoOwnerApp(
     },
     template: () => loadFixtureRulebook(),
     telegram: mekoTg,
+    // Daily digest: dry run unless TELEGRAM_BOT_TOKEN, REEVE_DIGEST=on and TELEGRAM_OWNER_CHAT_ID are all set.
+    digest: { sender: digestSenderFromEnv() },
     webOrigin: origin,
+    store: mekoStore.store,
   },
   mekoOpen,
 );

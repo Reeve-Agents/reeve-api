@@ -23,10 +23,14 @@ export interface MekoTelegramDeps {
   /** Absolute web origin for "lihat bukti" links. */
   webOrigin: string;
   botUsername?: string;
+  /** The owner's daily digest text (built by code from the ledger); sent as the reply to /ringkasan. */
+  digest?: () => Promise<string> | string;
   now?: () => number;
 }
 
 const SUBJECT = /^K\d{2,3}$/;
+/** Subject of the owner's own chat link; tenant subjects are K05-style pseudonyms. */
+export const OWNER_SUBJECT = "PEMILIK";
 const CODE_TTL = 24 * 3_600_000;
 
 export function mekoTelegram(deps: MekoTelegramDeps) {
@@ -49,6 +53,18 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
     deps.store.save();
     return { code, url: deps.botUsername ? `https://t.me/${deps.botUsername}?start=${code}` : null, expires: new Date(now() + CODE_TTL).toISOString() };
   }
+
+  /** Owner: a one-time code that binds the owner's own chat, so it can ask /ringkasan. Tenant links are unchanged. */
+  function createOwnerLink(): { code: string; url: string | null; expires: string } {
+    const code = randomBytes(6).toString("base64url");
+    const l = links();
+    for (const [k, v] of Object.entries(l.codes)) if (v.expires < now()) delete l.codes[k];
+    l.codes[code] = { subject: OWNER_SUBJECT, expires: now() + CODE_TTL };
+    deps.store.save();
+    return { code, url: deps.botUsername ? `https://t.me/${deps.botUsername}?start=${code}` : null, expires: new Date(now() + CODE_TTL).toISOString() };
+  }
+
+  const ownerLinked = () => Object.values(links().chats).some((c) => c.subject === OWNER_SUBJECT);
 
   /** Owner: the same explanation as a wa.me link the owner sends themselves (no number, no API). */
   async function explainForWhatsApp(subject: string, question: string) {
@@ -79,13 +95,19 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
       delete l.codes[start[1]!];
       l.chats[chatKey(chat)] = { subject: c.subject, at: new Date(now()).toISOString() };
       deps.store.save();
+      if (c.subject === OWNER_SUBJECT) return reply("Terhubung sebagai pemilik. Kirim /ringkasan kapan saja untuk ringkasan hari ini. Reeve tidak mengirim pesan sendiri kecuali Anda mengaktifkannya.");
       return reply(`Terhubung. Anda bisa bertanya, misalnya "Kenapa saya didenda?". Jawaban diambil dari catatan keputusan Reeve, lengkap dengan buktinya.`);
     }
     const who = l.chats[chatKey(chat)];
     if (!who) return null;
+    if (who.subject === OWNER_SUBJECT) {
+      if (/^\/ringkasan(@\w+)?$/i.test(text) && deps.digest) return reply(await deps.digest());
+      const a = await (await ask()).ask(text.slice(0, 300), { role: "owner", channel: "telegram" });
+      return reply(a.text.replace(/\nLihat bukti: /, "\n\nLihat bukti: "));
+    }
     const a = await (await ask()).ask(text.slice(0, 300), { role: "tenant", subject: who.subject, channel: "telegram" });
     return reply(a.text.replace(/\nLihat bukti: /, "\n\nLihat bukti: "));
   }
 
-  return { handle, createLink, explainForWhatsApp };
+  return { handle, createLink, createOwnerLink, ownerLinked, explainForWhatsApp };
 }

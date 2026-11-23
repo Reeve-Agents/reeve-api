@@ -49,6 +49,7 @@ if (run.status !== 0) process.exit(run.status ?? 1);
 say(`
 Done. For the deployed API (CreateOS reeve-api, branch main), set these environment variables by name:
   MEKO_API_KEY            Meko Cloud key (the API then uses https://mcp.mekodata.ai/mcp)
+  MEKO_DATAPACK_ID        datapack UUID, only if Cloud refuses to create one itself (MEKO_DATAPACK_ID_<WORKSPACE> per workspace)
   REEVE_MEKO_WORKSPACE    only if not "kos-melati"
   TELEGRAM_BOT_USERNAME   bot name for the tenant link (t.me/<name>?start=<code>)
   REEVE_MEKO_PUBLIC_ASK   "on" only if the public Tanya usaha box should accept questions

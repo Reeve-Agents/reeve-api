@@ -41,9 +41,12 @@ function daysLate(due: string, today: string): number {
   return Math.round((Date.parse(today) - Date.parse(due)) / 86_400_000);
 }
 
-/** An owner exception in memory: "Kamar 3 boleh telat sampai 10 hari". */
+/**
+ * An owner exception in memory: "Kamar 3 boleh telat sampai 10 hari". Only the owner's wording counts ("boleh telat"):
+ * Meko Cloud also distils facts from the Operator's own traces ("kamar 5 ... telat 10 hari"), and those are not permission.
+ */
 export function exceptionDays(text: string, room: string): number | null {
-  const m = text.match(new RegExp(`kamar ${room}\\b[^.]*?telat (?:sampai |hingga )?(\\d+) hari`, "i"));
+  const m = text.match(new RegExp(`kamar ${room}\\b[^.]*?boleh telat (?:sampai |hingga )?(\\d+) hari`, "i"));
   return m ? Number(m[1]) : null;
 }
 
@@ -97,8 +100,8 @@ export async function rentTick(run: MekoRun, bills: TenantBill[], today: string,
     const d = await op.decide({
       input: `${b.id} kamar ${b.room}: telat ${late} hari`,
       output: { action, via: res.via, autonomy: gate },
-      reasoning: wantsNotice ? `Rule R4: day ${late} late is the notice day.` : `Rule R2: reminders on day ${cards.reminder_days.join(" and ")}; today is day ${late}.${gate === "ask" ? " The reminder class is still at 'ask', so it waits for the owner." : ""}`,
-      action: gate === "ask" ? "ask_owner" : action,
+      reasoning: wantsNotice ? `Rule R4: day ${late} late is the notice day.` : `Rule R2: reminders on day ${cards.reminder_days.join(" and ")}; today is day ${late}.${gate === "ask" ? " The reminder class is still at 'ask', so it waits for the owner." : res.via === "staged" ? " The message is staged for the 10-minute undo window; it counts as a clean run only once it has run." : ""}`,
+      action: gate === "ask" ? "ask_owner" : res.via === "staged" ? "remind_staged" : action,
       action_class: action === "notice" ? "notice" : "reminder",
       subject: b.id,
     });

@@ -88,6 +88,8 @@ export interface WorkspaceOptions {
   ledger: Ledger;
   pseudonyms?: Pseudonymiser;
   now?: () => Date;
+  /** Where MEKO_DATAPACK_ID[_<WORKSPACE>] is read from (default: process.env). */
+  env?: NodeJS.ProcessEnv;
 }
 
 export class MekoWorkspace {
@@ -109,15 +111,40 @@ export class MekoWorkspace {
     return `reeve-${workspace}`;
   }
 
-  /** Finds or creates the workspace's datapack. Meko wants a conversation on every call, so open a setup one first. */
+  /**
+   * Finds or creates the workspace's datapack. Local Meko wants a conversation on every call, so a setup one comes
+   * first. Meko Cloud is the other way round: a conversation needs a datapack id (`datapack_id_required`), while
+   * datapack_search / datapack_create only want a non-empty conversation_id, so a placeholder id bootstraps it.
+   */
   static async open(transport: MekoTransport, opts: WorkspaceOptions): Promise<MekoWorkspace> {
-    const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}` }), "conversation_id", "id");
     const name = MekoWorkspace.datapackName(opts.workspace);
-    const find = async () => {
-      const listed = await transport.call("datapack_list", { conversation_id: setup, limit: 200 });
-      const packs = (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
-      return packs.find((p) => (p.datapack_name ?? p.name) === name);
-    };
+    const tools = await transport.tools();
+    const cloud = tools.includes("datapack_search") && tools.includes("track_token_usage");
+    const packsOf = (listed: unknown) => (Array.isArray(listed) ? listed : ((listed as { datapacks?: unknown[] })?.datapacks ?? [])) as Record<string, unknown>[];
+    const named = (packs: Record<string, unknown>[]) => packs.find((p) => (p.datapack_name ?? p.name) === name);
+    if (cloud) {
+      const boot = "0".repeat(32);
+      // An explicit id wins: MEKO_DATAPACK_ID_<WORKSPACE> (e.g. MEKO_DATAPACK_ID_KOS_MELATI), else MEKO_DATAPACK_ID.
+      const env = opts.env ?? process.env;
+      const explicit = env[`MEKO_DATAPACK_ID_${opts.workspace.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`] || env.MEKO_DATAPACK_ID;
+      let datapackId = explicit;
+      if (!datapackId) {
+        const find = async () => named(packsOf(await transport.call("datapack_search", { name, conversation_id: boot })));
+        let hit = await find();
+        if (!hit) {
+          const created = (await transport.call("datapack_create", { conversation_id: boot, name })) as Record<string, unknown>;
+          if (created.error && created.error !== "CONFLICT") {
+            throw new Error(`meko: Meko Cloud would not create datapack "${name}" (${String(created.error)}: ${String(created.detail ?? "").slice(0, 120)}). Create one in the Meko Cloud app and set MEKO_DATAPACK_ID to its UUID.`);
+          }
+          hit = created.error === "CONFLICT" ? await find() : created;
+        }
+        datapackId = str(hit, "datapack_id", "id");
+      }
+      const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}`, datapack_id: datapackId }), "conversation_id", "id");
+      return new MekoWorkspace(transport, opts.workspace, opts.ledger, datapackId, setup, opts);
+    }
+    const setup = str(await transport.call("conversation_create", { agent_id: "reeve", title: `Reeve setup: ${opts.workspace}` }), "conversation_id", "id");
+    const find = async () => named(packsOf(await transport.call("datapack_list", { conversation_id: setup, limit: 200 })));
     let hit = await find();
     if (!hit) {
       const created = (await transport.call("datapack_create", { conversation_id: setup, name })) as Record<string, unknown>;
@@ -150,13 +177,20 @@ export class MekoWorkspace {
   }
 
   async conversation(agent: string, conversationId: string): Promise<MekoConversation> {
-    const got = (await this.transport.call("conversation_get", {
-      datapack_id: this.datapackId,
-      conversation_id: conversationId,
-      agent_id: agent,
-      include_messages: true,
-    })) as MekoConversation;
-    return { ...got, messages: got.messages ?? [] };
+    const get = async (extra: Record<string, unknown>) =>
+      (await this.transport.call("conversation_get", { datapack_id: this.datapackId, conversation_id: conversationId, agent_id: agent, include_messages: true, ...extra })) as MekoConversation;
+    const got = await get({});
+    let messages = got.messages ?? [];
+    // Meko Cloud returns at most 100 messages per call (limit/offset); a busy Operator conversation has more.
+    if ((await this.transport.tools()).includes("track_token_usage")) {
+      const page = 100;
+      for (let offset = page; messages.length === offset && offset < 5000; offset += page) {
+        const more = (await get({ limit: page, offset })).messages ?? [];
+        messages = [...messages, ...more];
+        if (more.length < page) break;
+      }
+    }
+    return { ...got, messages };
   }
 }
 
@@ -234,7 +268,13 @@ export class AgentTrace {
     };
     // Promoted (collective) memories come back as knowledge-base chunks with source "memory" and
     // without their metadata, so callers must read facts from the text, not from metadata.
-    const kb = res.results?.knowledge_base ?? [];
+    let kb = res.results?.knowledge_base ?? [];
+    // Meko Cloud's context_search sometimes skips the knowledge-base source ("some sources failed or were not searched")
+    // and then misses promoted owner exceptions, so ask the knowledge base directly when it came back empty.
+    if (kb.length === 0 && (await this.run.ws.transport.tools()).includes("knowledgebase_search") && (await this.run.ws.transport.tools()).includes("track_token_usage")) {
+      const direct = (await this.run.ws.transport.call("knowledgebase_search", { ...this.base(), query: this.clean(query), limit })) as { results?: Record<string, unknown>[] };
+      kb = direct.results ?? [];
+    }
     const filters = (k: Record<string, unknown>) => (k.metadata_filters ?? {}) as Record<string, unknown>;
     const lookup: Lookup = {
       query: this.clean(query),
@@ -270,7 +310,31 @@ export class AgentTrace {
     const id = res.results?.[0]?.id ?? str(res, "id");
     if (!opts.promote) return { id };
     const p = (await this.run.ws.transport.call("memory_promote", { ...this.base(), memory_ids: [id] })) as { inserted_ids?: string[] };
+    await this.waitUntilShared(text);
     return { id, promoted: p.inserted_ids?.[0] };
+  }
+
+  /**
+   * On Meko Cloud a promoted memory reaches the knowledge base a little later (local Meko: at once). An Operator
+   * that checks for an owner exception right after the owner granted it would miss it and charge a fee, so wait
+   * until a search finds it (best effort, bounded; `sharedDelayMs` is how long it took, -1 if it never showed).
+   */
+  sharedDelayMs?: number;
+  private async waitUntilShared(text: string, maxMs = Number(process.env.REEVE_MEKO_SHARED_WAIT_MS ?? 120_000)): Promise<void> {
+    const ws = this.run.ws;
+    const tools = await ws.transport.tools();
+    if (!tools.includes("track_token_usage") || !tools.includes("knowledgebase_search")) return;
+    const needle = this.clean(text).slice(0, 40).toLowerCase();
+    const t0 = Date.now();
+    while (Date.now() - t0 < maxMs) {
+      const res = await ws.transport.call("knowledgebase_search", { ...this.base(), query: this.clean(text).slice(0, 200), limit: 10 });
+      if (JSON.stringify(res).toLowerCase().includes(needle.replace(/"/g, '\\"'))) {
+        this.sharedDelayMs = Date.now() - t0;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 4000));
+    }
+    this.sharedDelayMs = -1;
   }
 
   /** Stores JSON as a Meko artifact; Meko addresses it by SHA-256 (`content_hash`). */

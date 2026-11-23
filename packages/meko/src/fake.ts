@@ -36,6 +36,9 @@ export class FakeMeko implements MekoTransport {
   readonly usage: Record<string, unknown>[] = [];
   calls: string[] = [];
 
+  /** Emulates Meko Cloud: a conversation needs a datapack id, and datapack_search / datapack_create need some conversation_id. */
+  requireDatapack = false;
+
   constructor(private readonly toolNames: string[] = []) {}
 
   async tools(): Promise<string[]> {
@@ -54,6 +57,7 @@ export class FakeMeko implements MekoTransport {
     if (tool !== "conversation_create" && !args.conversation_id) throw new MekoError(tool, "conversation_id is required");
     switch (tool) {
       case "conversation_create": {
+        if (this.requireDatapack && !args.datapack_id) return { error: "datapack_id_required" };
         const agent = String(args.agent_id ?? "meko_agent");
         if (args.session_id) {
           const owner = this.sessions.get(String(args.session_id));
@@ -66,6 +70,10 @@ export class FakeMeko implements MekoTransport {
       }
       case "datapack_list":
         return [...this.packs].filter(([, n]) => !args.query || n.includes(String(args.query))).map(([id, name]) => ({ datapack_id: id, datapack_name: name }));
+      case "datapack_search": {
+        const hits = [...this.packs].filter(([, n]) => (!args.name || n === args.name) && (!args.query || n.includes(String(args.query))));
+        return { datapacks: hits.map(([id, name]) => ({ datapack_id: id, datapack_name: name })), has_more: false, next_cursor: "", total: null };
+      }
       case "datapack_create": {
         const id = randomUUID();
         this.packs.set(id, String(args.name));
@@ -81,7 +89,7 @@ export class FakeMeko implements MekoTransport {
       case "conversation_get": {
         const c = this.conv(args, tool);
         if (args.agent_id !== c.agent_id) throw new MekoError(tool, "conversation_not_found");
-        return { id: c.id, agent_id: c.agent_id, run_id: c.run_id ?? null, title: c.title, metadata: c.metadata, message_count: c.messages.length, messages: args.include_messages ? structuredClone(c.messages) : undefined };
+        return { id: c.id, agent_id: c.agent_id, run_id: c.run_id ?? null, title: c.title, metadata: c.metadata, message_count: c.messages.length, messages: args.include_messages ? structuredClone(this.requireDatapack ? c.messages.slice(Number(args.offset ?? 0), Number(args.offset ?? 0) + Number(args.limit ?? 100)) : c.messages) : undefined };
       }
       case "memory_add": {
         const m: Mem = { id: randomUUID(), memory: String(args.text), hash: createHash("md5").update(String(args.text)).digest("hex"), datapack_id: args.datapack_id as string, agent_id: String(args.agent_id), promoted: false, metadata: (args.metadata as Record<string, unknown>) ?? {} };

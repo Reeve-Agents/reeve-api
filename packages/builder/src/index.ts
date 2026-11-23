@@ -19,8 +19,10 @@ export interface ParsedSop {
 }
 
 /** Phase 1: plain-language SOP → structured rule cards (+ clarifying questions) for one domain pack. */
-export async function parseSop(provider: LLMProvider, sop: string, pack: PackId = "rent-collection", hints?: SopHints, opts?: { onUsage?: UsageListener }): Promise<ParsedSop> {
-  const rulebook = Rulebook.parse(await provider.parseSop(sop, pack, hints, opts));
+export async function parseSop(provider: LLMProvider, sop: string, pack: PackId = "rent-collection", hints?: SopHints, opts?: { onUsage?: UsageListener; sharedHints?: string[] }): Promise<ParsedSop> {
+  // Shared hints (Gotong Royong) ride along in the hints; with none, the call is exactly what it was.
+  const merged = opts?.sharedHints?.length ? { ...hints, sharedHints: opts.sharedHints } : hints;
+  const rulebook = Rulebook.parse(await provider.parseSop(sop, pack, merged, opts?.onUsage ? { onUsage: opts.onUsage } : undefined));
   return { rulebook, issues: validateRulebook(rulebook), provider: provider.name };
 }
 

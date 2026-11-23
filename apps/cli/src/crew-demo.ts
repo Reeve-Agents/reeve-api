@@ -6,15 +6,19 @@
 //
 //   npm run crew:demo                   # local Meko, templates only (no LLM cost)
 //   npm run crew:demo -- --llm          # Worker on Claude Haiku 5.5 (needs ANTHROPIC_API_KEY)
+//   npm run crew:demo -- --amend        # also seed repeated owner exceptions and one pending SOP amendment
+//                                       # (run the API with REEVE_SOP_AMENDMENTS=on to see it)
 //   npm run crew:demo -- --fresh        # drop the demo datapack and ledger first
 //   npm run crew:demo -- --ledger=pg    # ledger in Postgres (DATABASE_URL), as the deployed API reads it
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, playbookB, playbookC, raporHtml, rentTick, storeRapor,
+  AskBusiness, approveBound, buildRapor, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
+  amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
 } from "@reeve/crew";
+import { filePersistence } from "../../api/src/persistence";
 import { AnthropicProvider } from "@reeve/llm";
 import { connectMeko, mekoEndpointFromEnv, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import { kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, repoRoot, runAttempt } from "@reeve/pipeline";
@@ -47,7 +51,9 @@ if (args.has("--fresh")) {
   say("fresh: demo datapack and ledger removed");
 }
 mkdirSync(dir, { recursive: true });
-const ledger = persistence ? (await persistence.openWorkspace(`meko-${WS}`)).ledger : new Ledger(join(dir, "ledger.jsonl"));
+// The store holds what the owner web UI reads: the review queue and the autonomy ladder.
+const opened = await (persistence ?? filePersistence(home)).openWorkspace(`meko-${WS}`);
+const ledger = opened.ledger;
 say(`ledger: ${persistence ? `Postgres workspace meko-${WS}` : join(dir, "ledger.jsonl")} (${ledger.entries().length} entries before)`);
 const ws = await MekoWorkspace.open(meko, { workspace: WS, ledger, pseudonyms: new Pseudonymiser() });
 say(`datapack ${MekoWorkspace.datapackName(WS)} = ${ws.datapackId}`);
@@ -72,7 +78,8 @@ if (args.has("--llm")) {
 
 // 1. The SOP itself: Builder compiles, Auditor runs every planted defect in the sandbox, owner approves.
 const day = "2026-12-01";
-const run = ws.run(`run_kos_${day.replaceAll("-", "")}`);
+// Unique per seed: Meko Cloud keeps conversations for good and dedups on the session id (workspace:agent:run), so a second seed must not reuse the first one's.
+const run = ws.run(`run_kos_${day.replaceAll("-", "")}_${Date.now().toString(36)}`);
 const rulebook = loadFixtureRulebook("kos-melati");
 say("auditing the Kos Melati SOP in the local sandbox ...");
 const attempt = await runAttempt({ repoRoot, rulebook, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `meko-${Date.now().toString(36)}` });
@@ -111,9 +118,27 @@ const bills: TenantBill[] = [
   { id: "K17", room: "17", due: day, paid: false, tenure_months: 2 },
 ];
 const ladder = new Ladder(ws);
+// Earlier in the month 18 more reminders went out by themselves without a complaint: with the ones
+// below, "Pengingat bayar" has the 20 clean receipts that let Reeve ask the owner to move it up.
+const earlier: TenantBill[] = Array.from({ length: 18 }, (_, i) => ({ id: `K${20 + i}`, room: String(20 + i), due: "2026-11-01", paid: false, tenure_months: 6 }));
+await rentTick(run, earlier, "2026-11-04", { execute: (tool, a) => execute("log", tool, a), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
 for (const today of ["2026-12-04", "2026-12-08", "2026-12-11"]) {
   const out = await rentTick(run, bills, today, { execute: (tool, a) => execute("log", tool, a), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
   say(`tick ${today}: ${out.filter((o) => o.action !== "none").map((o) => `${o.id} ${o.action}`).join(", ")}`);
+}
+
+// 2b. Auto reminders are STAGED for the 10-minute undo window, not sent at once. A fake clock puts
+// two of them past the window (the Log connector runs them, exactly once) and two inside it, so the
+// owner page shows both: a live countdown with "Batalkan" and "Sudah jalan". Nothing is really sent.
+{
+  const outbox = new Outbox(ws, opened.store, ladder);
+  const t0 = Date.now();
+  const ages = [26, 13, 4, 1].map((m) => t0 - m * 60_000);
+  let n = 0;
+  const staged: TenantBill[] = ["K41", "K42", "K43", "K44"].map((id, i) => ({ id, room: String(41 + i), due: day, paid: false, tenure_months: 4 }));
+  await rentTick(run, staged, "2026-12-04", { execute: async (tool, a) => (await outbox.stage({ action_class: "reminder", tool, args: a, subject: String(a.to) }, ages[n++]!), { ok: true, via: "staged" }), gate: (cls, unusual) => (cls === "reminder" ? "auto" : ladder.gate(cls, unusual)) });
+  const ran = await outbox.flush(t0, (tool, a) => execute("log", tool, a));
+  say(`outbox: ${staged.length} reminders staged, ${ran.length} past the 10-minute window ran (Log connector), ${outbox.items().filter((i) => i.status === "staged").length} can still be undone`);
 }
 
 // 3. "Kenapa saya didenda?" on WhatsApp, answered by the read-only agent from the trace.
@@ -145,6 +170,7 @@ const approvalSeq = ws.decisions().find((d) => d.entry_hash === b.state.approved
 say(`autonomy from the approval: ${ladder.grantFromPlaybook(b.state.playbook, approvalSeq).join(", ")} -> ask_if_unusual`);
 const listing = await b.roomVacant("7", "3 Desember 2026");
 await b.reviewListing(listing.id, { approve: true });
+for (const [room, from] of [["9", "10 Desember 2026"], ["11", "12 Desember 2026"]] as const) await b.roomVacant(room, from); // their drafts wait in the owner's review queue
 await b.prospectMessage("p1", "Rina Kartika", "7", "Halo kak, harga sewa kamar 7 berapa per bulan?");
 await b.prospectMessage("p1", "Rina Kartika", "7", "Fasilitasnya apa aja? ada wifi?");
 await b.prospectMessage("p1", "Rina Kartika", "7", "Bisa nego jadi 1,3 juta?");
@@ -182,6 +208,31 @@ for (let i = 0; i < 6 && c.state.status === "running"; i++) {
   say(`discovery: ${st.candidates.length} candidates, replay ${st.replay.agree}/${st.replay.bills}, mode ${res.mode}, audit ${res.audit?.killed}/${res.audit?.total}`);
 }
 
+// 6b2. --amend: the owner keeps granting the same exception ("boleh telat sampai 15 hari"), so Reeve
+// proposes an SOP amendment, the Auditor tests it with the planted defects, and it waits for the owner.
+if (args.has("--amend")) {
+  const data = opened.store.data;
+  await recordException(ws, data, { rule_id: "R3", reason: izin, subject: "K03", month: "2026-12" });
+  for (const [subject, month, days] of [["K03", "2026-08", 12], ["K05", "2026-09", 14], ["K08", "2026-10", 15]] as const)
+    await recordException(ws, data, { rule_id: "R3", reason: `Kamar ${Number(subject.slice(1))} boleh telat sampai ${days} hari, izin pemilik.`, subject, month });
+  const out = await scanAmendments(ws, data, {
+    audit: async (rb) => {
+      const a = await runAttempt({ repoRoot, rulebook: rb, scenario: kosMelatiScenario(), sandbox: new LocalSandbox(), runId: `amend-${Date.now().toString(36)}` });
+      return { status: a.verdict.status, cases: a.plan.cases.length, killed: a.results?.mutation.killed ?? 0, total: a.results?.mutation.total ?? 0 };
+    },
+    template: () => rulebook,
+    history: amendSampleHistory(),
+  });
+  say(`amend: ${loadExceptions(data).length} exceptions, ${out.shortfalls.length} shortfall(s) [${out.path}]`);
+  for (const r of out.results) say(`  ${r.shortfall.rule_id} ${r.shortfall.label} x${r.shortfall.count}: ${r.result.offered ? `offered ${r.result.amendment.id} (${r.result.amendment.audit.killed}/${r.result.amendment.audit.total} defects, ${r.result.amendment.improvement?.summary})` : r.result.reason}`);
+}
+
+// 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder.
+saveReview(opened.store.data, [...b.state.queue, ...c.state.queue]);
+saveLadderState(opened.store.data, ladder.state);
+opened.store.save();
+say(`owner state: ${b.state.queue.length + c.state.queue.length} review items (${[...b.state.queue, ...c.state.queue].filter((q) => q.status === "pending").length} pending), ladder ${JSON.stringify(Object.fromEntries(Object.entries(ladder.state.levels).map(([k, v]) => [k, v.level])))}`);
+
 // 7. Anchor the ledger (local; `npm run anchor:now` publishes the root on Monad testnet).
 const leaves = anchorLeaves(ledger.entries());
 ledger.append({ kind: "anchor", at: new Date().toISOString(), merkle_root: merkleRoot(leaves), leaves: leaves.length, anchor: "local-ledger" });
@@ -198,6 +249,7 @@ const metrics = (await meko.call("datapack_metrics", { conversation_id: ws.setup
 say(`\n${all.length} traced decisions, ${ok} verified against Meko; ${logged.length} connector calls logged (not sent)`);
 say(`rapor artifact ${stored.content_hash.slice(0, 16)}… -> ${join(dir, "rapor.html")}`);
 if (metrics?.context_efficiency) say(`context_search: ${metrics.searches} searches, ${metrics.context_efficiency.tokens_sent} tokens sent, ${metrics.context_efficiency.tokens_saved} saved (${metrics.context_efficiency.saved_pct}%)`);
+say(`input saved vs full context (Reeve ledger, ${rapor.savings.events} Operator events): ${rapor.savings.saved} of ${rapor.savings.baseline_input} baseline tokens${rapor.savings.ratio ? ` (${rapor.savings.ratio}x)` : ""}; Reeve side ${rapor.savings.reeve_input_basis.billed} billed + ${rapor.savings.reeve_input_basis.estimated} estimated`);
 say(`LLM tokens: ${rapor.tokens.llm_input} in / ${rapor.tokens.llm_output} out over ${rapor.tokens.worker_calls} Worker calls`);
 await meko.close();
 await persistence?.close();

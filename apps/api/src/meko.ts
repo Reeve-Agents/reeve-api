@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { AskBusiness, buildRapor, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, listShares, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { Hono } from "hono";
@@ -116,7 +116,16 @@ export interface MekoOwnerDeps {
   /** Absolute web origin for share links. */
   webOrigin?: string;
   /** Telegram tenant links and the wa.me fallback (meko-telegram.ts). */
-  telegram?: { createLink(subject: string): unknown; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
+  /** Store of the Meko workspace; the review queue and the autonomy ladder live under `data.meko_review` / `data.meko_ladder`. */
+  store?: { data: object; save(): void };
+  /** SOP amendments (self-learning loop). Default: the REEVE_SOP_AMENDMENTS flag, off unless set. */
+  amend?: { enabled?: () => boolean; env?: Record<string, string | undefined>; history?: () => History | null };
+  telegram?: { createLink(subject: string): unknown; createOwnerLink?(): unknown; ownerLinked?(): boolean; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
+  /** What runs a staged action once its 10-minute window has passed. Default: the Log connector (nothing is sent). */
+  outbox?: { execute?: (tool: string, args: Record<string, unknown>) => Promise<ExecResult> };
+  /** Where the daily digest goes. Default: dry run (text only). Live Telegram needs TELEGRAM_BOT_TOKEN + REEVE_DIGEST=on. */
+  digest?: { sender?: DigestSender };
+  now?: () => number;
 }
 
 /**
@@ -191,5 +200,232 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     return c.json(await deps.telegram.explainForWhatsApp(String(subject ?? "").toUpperCase(), String(question ?? "").slice(0, 300)));
   });
 
-  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }) };
+  // Review queue and autonomy ladder (account level). State lives in the store; every decision is a
+  // traced owner turn. Approving here sends nothing: the connector sends on the next run.
+  const needStore = () => {
+    if (!deps.store) throw new Error("Data tinjauan belum tersedia di server ini (tidak ada store).");
+    return deps.store;
+  };
+  const by = (c: { env?: { account: string } }) => `account ${c.env?.account ?? "?"}`;
+  let ladder: Ladder | null = null;
+  const getLadder = async () => (ladder ??= new Ladder(await open(), loadLadderState(needStore().data)));
+  const deciding = new Set<string>();
+
+  const clock = () => deps.now?.() ?? Date.now();
+  const logExec = deps.outbox?.execute ?? (async (): Promise<ExecResult> => ({ ok: true, via: "log" }));
+  let box: Outbox | null = null;
+  const getOutbox = async () => (box ??= new Outbox(await open(), needStore(), await getLadder()));
+  /** Runs what is due (through the injected connector), then returns the outbox. */
+  const settled = async () => {
+    const b = await getOutbox();
+    await b.flush(clock(), logExec);
+    return b;
+  };
+  const sender = () => deps.digest?.sender ?? dryRun;
+  const webOrigin = () => deps.webOrigin ?? "";
+  const digestFor = async (date?: string) => {
+    const ws = await open();
+    const day = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : wibDate(clock());
+    await settled();
+    return buildDigest(ws, await getLadder(), needStore(), day, { webOrigin: webOrigin() });
+  };
+
+  const view = (i: ReturnType<typeof loadReview>[number]) => ({ ...i, action_class: stepOf(i.step)?.action_class ?? (i.kind === "contract" ? "accept_tenant" : "review"), step_title: stepOf(i.step)?.title ?? i.step });
+
+  // Auto-run actions wait 10 minutes in the outbox; undo cancels one for real, after that it has run.
+  app.get("/outbox", async (c) => {
+    await settled();
+    const now = clock();
+    const label = (cls: string) => DEFAULT_POLICIES[cls]?.label ?? cls;
+    const all = loadOutbox(needStore().data).map((i) => ({ id: i.id, action_class: i.action_class, label: label(i.action_class), tool: i.tool, subject: i.subject, status: i.status, staged_at: i.staged_at, due_at: i.due_at, seconds_left: i.status === "staged" ? Math.max(0, Math.ceil((Date.parse(i.due_at) - now) / 1000)) : 0, stage_receipt: i.stage_receipt, done_receipt: i.done_receipt, undo_receipt: i.undo_receipt, via: i.via }));
+    const open_ = all.filter((i) => i.status === "staged" || i.status === "running").sort((a, b2) => a.seconds_left - b2.seconds_left);
+    const recent = all.filter((i) => i.status !== "staged" && i.status !== "running").sort((a, b2) => (b2.staged_at < a.staged_at ? -1 : 1)).slice(0, 20);
+    return c.json({ window_seconds: UNDO_WINDOW_MS / 1000, items: [...open_, ...recent], staged: open_.length });
+  });
+
+  app.post("/outbox/:id/undo", async (c) => {
+    const b = await settled();
+    try {
+      const r = await b.undo(c.req.param("id"), clock());
+      return c.json({ receipt: r.receipt, level: r.level, item: r.item, note: "Dibatalkan. Tindakan ini tidak pernah dikirim; kelasnya turun satu level." });
+    } catch (e) {
+      if (e instanceof UndoRefused) return c.json({ error: e.message }, e.code === "missing" ? 404 : 409);
+      throw e;
+    }
+  });
+
+  // The daily digest: built by code from ledger facts. Previewing sends nothing; the wa.me link is
+  // opened by the owner. /digest/send is a dry run unless TELEGRAM_BOT_TOKEN and REEVE_DIGEST=on are set.
+  app.get("/digest", async (c) => {
+    const d = await digestFor(c.req.query("date"));
+    const sent = (needStore().data as { meko_digest?: Record<string, { receipt: string; channel: string; delivered: boolean }> }).meko_digest?.[d.date] ?? null;
+    return c.json({ ...d, wa_me: `https://wa.me/?text=${encodeURIComponent(d.text)}`, channel: { telegram_linked: deps.telegram?.ownerLinked?.() ?? false, live: sender().live, name: sender().channel }, sent });
+  });
+
+  app.post("/digest/send", async (c) => {
+    const d = await digestFor();
+    const r = await sendDigest({ ws: await open(), ladder: await getLadder(), store: needStore(), date: d.date, webOrigin: webOrigin() }, sender());
+    return c.json({ ...r, note: r.delivered ? "Ringkasan terkirim lewat Telegram." : "Dry-run: tidak ada pesan terkirim. Buka tautan WhatsApp untuk mengirim sendiri." });
+  });
+
+  app.post("/telegram/owner-link", (c) => {
+    if (!deps.telegram?.createOwnerLink) return c.json({ error: "Telegram belum diatur di server ini (TELEGRAM_WEBHOOK_SECRET)." }, 409);
+    return c.json(deps.telegram.createOwnerLink());
+  });
+
+  app.get("/weak", async (c) => c.json(await weakSearches(await open())));
+  app.post("/weak/verify", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { log_id?: string };
+    if (!body.log_id || typeof body.log_id !== "string") return c.json({ error: "log_id wajib" }, 400);
+    try {
+      return c.json(await verifyWeak(await open(), body.log_id));
+    } catch (e) {
+      return c.json({ error: `Cek ulang gagal: ${String(e).slice(0, 120)}` }, 409);
+    }
+  });
+
+  app.get("/review", (c) => {
+    const items = loadReview(needStore().data);
+    const rank = (i: { status: string }) => (i.status === "pending" ? 0 : 1);
+    const sorted = [...items].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.created_at.localeCompare(b.created_at) : (b.decided_at ?? "").localeCompare(a.decided_at ?? "")));
+    return c.json({ items: sorted.slice(0, 100).map(view), pending: items.filter((i) => i.status === "pending").length });
+  });
+
+  app.post("/review/:id", async (c) => {
+    const store = needStore();
+    const id = c.req.param("id");
+    const body = (await c.req.json().catch(() => ({}))) as { action?: string; text?: string };
+    const action = body.action;
+    if (action !== "approve" && action !== "reject" && action !== "edit") return c.json({ error: "Pilih tindakan: approve, reject atau edit." }, 400);
+    const item = loadReview(store.data).find((i) => i.id === id);
+    if (!item) return c.json({ error: "Item tinjauan tidak ditemukan." }, 404);
+    if (item.status !== "pending" || deciding.has(id)) return c.json({ error: "Item ini sudah diputuskan." }, 409);
+    const step = stepOf(item.step);
+    let edited: string | undefined;
+    if (action === "edit") {
+      edited = String(body.text ?? "").trim();
+      if (!edited || edited.length > 3000) return c.json({ error: "Tulis teks yang diubah (maks. 3000 karakter)." }, 400);
+      // A changed draft passes the same Validator as the Worker's; nothing with a hit goes on.
+      const hits = item.kind === "draft" ? validate(edited, KOS_FACTS, step?.checks) : [];
+      if (hits.length) return c.json({ error: "Teks yang diubah belum lolos pemeriksaan.", hits }, 400);
+    }
+    deciding.add(id);
+    try {
+      const ws = await open();
+      const status = action === "approve" ? "approved" : action === "reject" ? "rejected" : "edited";
+      const subject = ws.pseudonyms.redact(item.subject);
+      const owner = await ws.run(`run_review_${Date.now().toString(36)}`).agent("owner", `Tinjau: ${step?.title ?? item.step}`);
+      const d = await owner.decide({
+        input: `review ${item.id} (${item.kind}): ${subject}`,
+        output: { item: item.id, kind: item.kind, status, draft_receipt: item.receipt, ...(edited ? { edited_text: edited } : {}), sent: false },
+        reasoning: `The owner (${by(c)}) ${status === "approved" ? "approved the draft unchanged" : status === "rejected" ? "rejected the draft" : "edited the draft; the new text passed the same Validator checks"}. Nothing is sent here: the connector sends on the next run, and only an approved or edited item.`,
+        action: `review_${action}`,
+        action_class: step?.action_class ?? (item.kind === "contract" ? "accept_tenant" : "review"),
+        subject,
+      });
+      if (edited) item.original_text = item.text;
+      item.status = status;
+      if (edited) {
+        item.text = edited;
+        item.hits = [];
+      }
+      item.decided_at = new Date().toISOString();
+      item.decision_receipt = d.receipt_hash;
+      store.save();
+      return c.json({ receipt: d.receipt_hash, draft_receipt: item.receipt, item: view(item), note: "Belum ada pesan terkirim. Pengiriman lewat konektor terjadi di jalan berikutnya." });
+    } finally {
+      deciding.delete(id);
+    }
+  });
+
+  app.get("/autonomy", async (c) => {
+    const l = await getLadder();
+    const classes = Object.entries(DEFAULT_POLICIES).map(([cls, p]) => {
+      const ev = l.evidence(cls);
+      const prop = l.proposal(cls);
+      const locked = !Number.isFinite(p.promote_after);
+      return {
+        cls,
+        label: p.label,
+        level: l.level(cls),
+        max_level: p.max_level,
+        locked,
+        promote_after: locked ? null : p.promote_after,
+        evidence: { clean: ev.clean, bad: ev.bad, receipts: ev.receipts.slice(0, 5) },
+        proposal: prop ? { question: prop.question, from: prop.from, to: prop.to } : null,
+        needs: locked ? null : Math.max(0, p.promote_after - ev.clean),
+      };
+    });
+    return c.json({ classes });
+  });
+
+  app.post("/autonomy/promote", async (c) => {
+    const { cls } = (await c.req.json().catch(() => ({}))) as { cls?: string };
+    const l = await getLadder();
+    if (!cls || !DEFAULT_POLICIES[cls]) return c.json({ error: "Kelas tindakan tidak dikenal." }, 400);
+    if (!l.proposal(cls)) return c.json({ error: "Belum cukup bukti bersih untuk naik level." }, 400);
+    // Owner confirmed while signed in; a step-up passkey ceremony is a follow-up.
+    const to = await l.promote(cls, { method: "session", credential_id: by(c) });
+    needStore().save();
+    return c.json({ cls, level: to });
+  });
+
+  app.post("/autonomy/demote", async (c) => {
+    const { cls } = (await c.req.json().catch(() => ({}))) as { cls?: string };
+    const l = await getLadder();
+    if (!cls || !DEFAULT_POLICIES[cls]) return c.json({ error: "Kelas tindakan tidak dikenal." }, 400);
+    if (l.level(cls) === "ask") return c.json({ error: "Sudah di level paling bawah (Tanya dulu)." }, 400);
+    const to = await l.demote(cls, "override", `owner override (${by(c)})`);
+    needStore().save();
+    return c.json({ cls, level: to });
+  });
+
+  // SOP amendments: repeated owner exceptions -> a tested proposal -> the owner decides. With the
+  // flag off the list is empty and nothing can be decided. Approving saves a rulebook version and sends nothing.
+  const amendOn = () => (deps.amend?.enabled ?? (() => amendmentsEnabled(deps.amend?.env)))();
+  const amendView = (a: ReturnType<typeof loadAmendments>[number]) => {
+    const { rulebook_after: _rb, ...rest } = a;
+    return rest;
+  };
+  const amending = new Set<string>();
+
+  app.get("/amendments", (c) => {
+    if (!amendOn()) return c.json({ enabled: false, items: [], pending: 0, threshold: SHORTFALL_MIN, exceptions: 0, open_shortfalls: 0 });
+    const data = needStore().data;
+    const items = loadAmendments(data);
+    const rank = (i: { status: string }) => (i.status === "pending" ? 0 : 1);
+    const sorted = [...items].sort((a, b) => rank(a) - rank(b) || (rank(a) === 0 ? a.created_at.localeCompare(b.created_at) : (b.decided_at ?? "").localeCompare(a.decided_at ?? "")));
+    return c.json({ enabled: true, items: sorted.slice(0, 50).map(amendView), pending: items.filter((i) => i.status === "pending").length, threshold: SHORTFALL_MIN, exceptions: loadExceptions(data).length, open_shortfalls: localShortfalls(loadExceptions(data)).length });
+  });
+
+  app.post("/amendments/scan", async (c) => {
+    if (!amendOn()) return c.json({ enabled: false, error: "Usulan perubahan SOP belum diaktifkan di server ini." }, 409);
+    if (!deps.audit) return c.json({ error: "Pengujian belum tersedia di server ini." }, 409);
+    const store = needStore();
+    const out = await scanAmendments(await open(), store.data, { audit: deps.audit, template: deps.template ?? (() => { throw new Error("Tidak ada SOP dasar di server ini."); }), history: deps.amend?.history?.() ?? null, env: deps.amend?.env });
+    store.save();
+    return c.json({ path: out.path, note: out.note, shortfalls: out.shortfalls.length, offered: out.results.filter((r) => r.result.offered).length });
+  });
+
+  for (const action of ["approve", "reject"] as const)
+    app.post(`/amendments/:id/${action}`, async (c) => {
+      if (!amendOn()) return c.json({ enabled: false, error: "Usulan perubahan SOP belum diaktifkan di server ini." }, 409);
+      const store = needStore();
+      const id = c.req.param("id");
+      const item = loadAmendments(store.data).find((a) => a.id === id);
+      if (!item) return c.json({ error: "Usulan tidak ditemukan." }, 404);
+      if (item.status !== "pending" || amending.has(id)) return c.json({ error: "Usulan ini sudah diputuskan." }, 409);
+      amending.add(id);
+      try {
+        const ws = await open();
+        // Owner confirmed while signed in; a step-up passkey ceremony is a follow-up (as for the ladder).
+        const done = action === "approve" ? await approveAmendment(ws, store.data, id, { method: "session", credential_id: by(c) }, by(c)) : await rejectAmendment(ws, store.data, id, by(c));
+        store.save();
+        return c.json({ receipt: done.decision_receipt, item: amendView(done), note: action === "approve" ? "Aturan baru disimpan sebagai versi SOP. Belum ada pesan terkirim." : "Usulan ditolak. SOP tidak berubah." });
+      } finally {
+        amending.delete(id);
+      }
+    });
+
+  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }), /** Digest text for today, for the owner's /ringkasan on Telegram. */ digestText: async () => (await digestFor()).text };
 }

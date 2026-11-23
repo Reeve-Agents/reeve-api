@@ -1,11 +1,12 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rentTick } from "@reeve/crew";
-import { FakeMeko, MekoWorkspace } from "@reeve/meko";
+import { loadReview, rentTick, type ReviewItem, saveReview } from "@reeve/crew";
+import { FakeMeko, MekoWorkspace, verifyDecision } from "@reeve/meko";
 import { Ledger } from "@reeve/receipts";
 import { describe, expect, it } from "vitest";
 import { createMekoApp, createMekoOwnerApp, mekoOpener } from "../src/meko";
+import { Store } from "../src/store";
 
 async function setup(allowAsk = false) {
   const meko = new FakeMeko();
@@ -84,5 +85,81 @@ describe("owner SOP Discovery API", () => {
     expect(res.mode).toBe("belajar");
     expect((await call("/discovery/nope")).status).toBe(404);
     expect((await call("/discovery", { chat: "bukan chat", payments_csv: "" })).status).toBe(400);
+  });
+});
+
+describe("owner review queue and autonomy ladder", () => {
+  async function ownerSetup() {
+    const meko = new FakeMeko();
+    const ledger = new Ledger(join(mkdtempSync(join(tmpdir(), "meko-review-")), "ledger.jsonl"));
+    const store = new Store(null);
+    const open = mekoOpener({ workspace: "kos-melati", ledger, connect: async () => meko });
+    const owner = createMekoOwnerApp({ store }, open);
+    const call = (p: string, body?: unknown) => owner.fetch(new Request(`http://x/api/meko/owner${p}`, body ? { method: "POST", body: JSON.stringify(body) } : {}), "acc1");
+    const mk = (id: string, step: string, kind: ReviewItem["kind"], text: string, extra: Partial<ReviewItem> = {}): ReviewItem => ({ id, step, kind, subject: "kamar 7", text, status: "pending", receipt: "ab".repeat(32), ...extra });
+    const good = "Kamar kos 7 kosong, Rp1.500.000 per bulan. (dibuat dengan bantuan AI)";
+    saveReview(store.data, [mk("rv1", "b1_listing", "draft", good), mk("rv2", "b1_listing", "draft", good), mk("rv3", "b1_listing", "draft", good), mk("rv4", "b6_accept", "contract", "Kontrak", { status: "approved" })]);
+    return { meko, ledger, store, open, call };
+  }
+
+  it("lists pending first, then records approve, reject and edit as owner receipts", async () => {
+    const { call, store, open } = await ownerSetup();
+    const list = (await (await call("/review")).json()) as { items: { id: string; status: string; action_class: string }[]; pending: number };
+    expect(list.items.map((i) => i.id)).toEqual(["rv1", "rv2", "rv3", "rv4"]);
+    expect(list.pending).toBe(3);
+    expect(list.items[0]!.action_class).toBe("listing_post");
+
+    const ok = (await (await call("/review/rv1", { action: "approve" })).json()) as { receipt: string; item: { status: string }; note: string };
+    expect(ok.receipt).toMatch(/^[0-9a-f]{64}$/);
+    expect(ok.item.status).toBe("approved");
+    expect(ok.note).toContain("Belum ada pesan terkirim");
+    expect((await call("/review/rv1", { action: "reject" })).status).toBe(409);
+
+    const no = (await (await call("/review/rv2", { action: "reject" })).json()) as { item: { status: string } };
+    expect(no.item.status).toBe("rejected");
+
+    expect((await call("/review/rv3", { action: "edit", text: "Kamar 7 Rp900.000 per bulan" })).status).toBe(400); // Validator: wrong price, no AI label
+    const ed = (await (await call("/review/rv3", { action: "edit", text: "Kamar kos 7 kosong, Rp1.500.000, dekat kampus. (dibuat dengan bantuan AI)" })).json()) as { receipt: string; item: { status: string; text: string } };
+    expect(ed.item).toMatchObject({ status: "edited" });
+    expect(ed.item.text).toContain("dekat kampus");
+
+    const ws = await open();
+    expect(ws.decisions({ agent: "owner" }).map((d) => d.action)).toEqual(["review_approve", "review_reject", "review_edit"]);
+    expect(ws.decisions({ agent: "owner" })[0]).toMatchObject({ action_class: "listing_post", subject: "kamar 7" });
+    expect((await verifyDecision(ws, ed.receipt)).ok).toBe(true);
+    expect(loadReview(store.data).find((i) => i.id === "rv3")!.original_text).toContain("Rp1.500.000");
+    expect((await call("/review/nope", { action: "approve" })).status).toBe(404);
+    expect((await call("/review/rv4", { action: "bogus" })).status).toBe(400);
+  });
+
+  it("refuses to promote without evidence, promotes with it, and the owner can demote", async () => {
+    const { call, open, store } = await ownerSetup();
+    const ws = await open();
+    const before = (await (await call("/autonomy")).json()) as { classes: { cls: string; level: string; locked: boolean; needs: number | null; proposal: unknown; evidence: { clean: number; receipts: string[] } }[] };
+    const rem = before.classes.find((c) => c.cls === "reminder")!;
+    expect(rem).toMatchObject({ level: "ask", locked: false, needs: 20, proposal: null });
+    expect(before.classes.find((c) => c.cls === "refund")).toMatchObject({ locked: true, needs: null });
+    expect((await call("/autonomy/promote", { cls: "reminder" })).status).toBe(400);
+    expect((await call("/autonomy/promote", { cls: "nope" })).status).toBe(400);
+    expect((await call("/autonomy/demote", { cls: "reminder" })).status).toBe(400); // already at the bottom
+
+    const op = await ws.run("run_rem").agent("operator", "Pengingat");
+    for (let i = 0; i < 20; i++) await op.decide({ input: `K${i}`, output: { action: "remind" }, reasoning: "Reminder day 3.", action: "remind", action_class: "reminder", subject: `K${i}` });
+    const after = (await (await call("/autonomy")).json()) as typeof before;
+    const r2 = after.classes.find((c) => c.cls === "reminder")!;
+    expect(r2.evidence.clean).toBe(20);
+    expect(r2.evidence.receipts).toHaveLength(5);
+    expect(r2.proposal).toMatchObject({ to: "ask_if_unusual" });
+
+    const up = (await (await call("/autonomy/promote", { cls: "reminder" })).json()) as { level: string };
+    expect(up.level).toBe("ask_if_unusual");
+    expect((store.data as { meko_ladder?: { levels: Record<string, { level: string }> } }).meko_ladder!.levels.reminder!.level).toBe("ask_if_unusual");
+    const promoted = ws.decisions({ action_class: "reminder" }).find((d) => d.action === "autonomy_promote")!;
+    const msg = (await ws.conversation(promoted.agent, promoted.conversation_id)).messages.find((m) => m.metadata?.reeve_receipt === promoted.entry_hash);
+    expect(msg?.reasoning).toContain("while signed in");
+    expect((await call("/autonomy/promote", { cls: "reminder" })).status).toBe(400); // the evidence restarts
+
+    const down = (await (await call("/autonomy/demote", { cls: "reminder" })).json()) as { level: string };
+    expect(down.level).toBe("ask");
   });
 });

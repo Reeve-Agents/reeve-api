@@ -111,7 +111,7 @@ export class Ladder {
     const d = await t.decide({
       input: prop.question,
       output: { from: prop.from, to: prop.to, clean_receipts: prop.clean, method: passkey.method },
-      reasoning: `${prop.clean} clean receipts of ${cls} since the last change, no override or complaint; the owner agreed with a ${passkey.method === "passkey" ? "passkey" : "demo passkey (offline seed)"}.`,
+      reasoning: `${prop.clean} clean receipts of ${cls} since the last change, no override or complaint; the owner agreed ${passkey.method === "passkey" ? "with a passkey" : passkey.method === "session" ? "while signed in (session confirmation, no passkey step-up yet)" : "with a demo passkey (offline seed)"}.`,
       action: "autonomy_promote",
       action_class: cls,
     });
