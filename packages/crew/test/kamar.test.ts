@@ -1,6 +1,6 @@
 import { verifyDecision } from "@reeve/meko";
 import { describe, expect, it } from "vitest";
-import { classify, KamarKosong, KOS_RENT_CARDS, lateFeeContractClause, newState, nextSlot, playbookB, rentTick } from "../src/index";
+import { classify, demoBills, dueDateWib, KamarKosong, KOS_DUE_DAY, KOS_RENT_CARDS, lateFeeContractClause, Ladder, liveTick, loadBillBook, newState, nextSlot, Outbox, playbookB, rentTick, saveBillBook } from "../src/index";
 import { DEMO_PASSKEY, testDeps } from "./helpers";
 
 describe("Playbook B: kamar kosong terisi sendiri", () => {
@@ -60,6 +60,30 @@ describe("Playbook B: kamar kosong terisi sendiri", () => {
     const run = ws.run("run_contract_fee");
     const out = await rentTick(run, [{ id: "K05", room: "5", due: "2026-12-01", paid: false, tenure_months: 3 }], "2026-12-09", { execute: async () => ({ ok: true, via: "log" }) });
     expect(out[0]).toMatchObject({ action: "charge_fee", amount: fee });
+  });
+
+  it("states the same due day as the live bills, and counts the fee from it (SOP: bills go out on the 1st, fee at H+7)", async () => {
+    const { deps, rail, ws } = await testDeps();
+    const crew = new KamarKosong(deps, newState(playbookB()));
+    await crew.approveB(DEMO_PASSKEY);
+    await crew.prospectMessage("p4", "Rina", "11", "jadwal survei kapan?");
+    await crew.viewingDone("p4", true);
+    await rail.simulatePayment(crew.prospects.p4!.invoice!.id);
+    const contract = await crew.depositPaid("p4");
+    const day = Number(contract.text.match(/jatuh tempo setiap tanggal (\d+)/)?.[1]);
+    expect(day).toBe(KOS_DUE_DAY);
+    expect(contract.text).not.toContain("tanggal 5");
+    expect(contract.text).toContain(`Belum lunas pada H+${KOS_RENT_CARDS.late_fee.days_after_due} sesudah jatuh tempo`);
+    // the live bills (the seed's and the month roll's) are due on that same day
+    const now = Date.parse("2026-12-04T01:00:00Z");
+    const store = { data: {} as object, save() {} };
+    const seeded = saveBillBook(store.data, demoBills(dueDateWib(now)), now);
+    expect(seeded.bills.every((b) => Number(b.due.slice(8)) === day)).toBe(true);
+    const ladder = new Ladder(ws);
+    await liveTick({ ws, store, ladder, outbox: new Outbox(ws, store, ladder), execute: async () => ({ ok: true, via: "log" }), now: () => Date.parse("2027-01-04T01:00:00Z") });
+    const rolled = loadBillBook(store.data)!;
+    expect(rolled.period).toBe("2027-01");
+    expect(rolled.bills.every((b) => Number(b.due.slice(8)) === day)).toBe(true);
   });
 
   it("stops itself when the target is reached", async () => {

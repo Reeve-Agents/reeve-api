@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { demoBills, KOS_FACTS, Ladder, liveExecutor, liveTick, loadBillBook, loadOutbox, monthStartWib, NoBills, Outbox, saveBillBook, tenantMessage, UNDO_WINDOW_MS, validate } from "../src/index";
+import { demoBills, dueDateWib, KOS_DUE_DAY, KOS_FACTS, kosDueDate, Ladder, liveExecutor, liveTick, loadBillBook, loadOutbox, markBillPaid, monthStartWib, NoBills, Outbox, saveBillBook, tenantMessage, UnknownBill, UNDO_WINDOW_MS, validate } from "../src/index";
 import { testDeps } from "./helpers";
 
 const MIN = 60_000;
@@ -138,6 +138,151 @@ describe("live billing tick", () => {
     const { tick, store } = await setup();
     for (let d = 1; d <= 20; d++) await tick(at(`2026-12-${String(d).padStart(2, "0")}`));
     expect(Object.keys(loadBillBook(store.data)!.ticks)).toHaveLength(14);
+  });
+});
+
+describe("a tick that fails midway", () => {
+  it("is resumable: a retry the same day stages each reminder exactly once", async () => {
+    const { tick, ladder, outbox, ws, store } = await setup("auto");
+    const realGate = ladder.gate;
+    let calls = 0;
+    ladder.gate = (cls, unusual) => {
+      if (++calls === 3) throw new Error("meko down");
+      return realGate(cls, unusual);
+    };
+    await expect(tick(at("2026-12-04"))).rejects.toThrow("meko down");
+    const book = loadBillBook(store.data)!;
+    expect(book.ticks["2026-12-04"]).toBeUndefined(); // the day is not done
+    expect(book.bills.filter((b) => b.last_tick === "2026-12-04").map((b) => b.id)).toEqual(["K03", "K05"]);
+    expect(outbox.items().map((i) => i.subject)).toEqual(["K03", "K05"]);
+
+    ladder.gate = realGate;
+    const r = await tick(at("2026-12-04", "08:02"));
+    expect(r.repeated).toBeUndefined();
+    expect(r.bills.map((b) => `${b.id}:${b.decision}`)).toEqual(["K03:remind_staged", "K05:remind_staged", "K08:remind_staged", "K17:remind_staged"]);
+    expect(outbox.items().map((i) => i.subject)).toEqual(["K03", "K05", "K08", "K17"]); // none twice
+    expect(r.staged).toHaveLength(4);
+    expect(r.receipts).toHaveLength(8);
+    expect(ws.decisions().filter((d) => d.action === "remind_staged")).toHaveLength(4);
+    expect(ws.decisions().filter((d) => d.action === "auto_stage")).toHaveLength(4);
+    expect(book.partial).toBeUndefined();
+    expect(Object.keys(book.ticks)).toEqual(["2026-12-04"]);
+    expect((await tick(at("2026-12-04", "08:03"))).repeated).toBe(true);
+    expect((await tick(at("2026-12-04", "08:20"))).flushed).toHaveLength(4); // each goes out once
+  });
+
+  it("does not stage a reminder twice when the failure came right after it was staged", async () => {
+    const { tick, outbox, ws } = await setup("auto");
+    const realStage = outbox.stage.bind(outbox);
+    let n = 0;
+    outbox.stage = async (input, now) => {
+      const item = await realStage(input, now);
+      if (++n === 3) throw new Error("boom after staging");
+      return item;
+    };
+    await expect(tick(at("2026-12-04"))).rejects.toThrow("boom after staging");
+    expect(outbox.items()).toHaveLength(3);
+    outbox.stage = realStage;
+    const r = await tick(at("2026-12-04", "08:02"));
+    expect(outbox.items().map((i) => i.subject)).toEqual(["K03", "K05", "K08", "K17"]);
+    expect(r.staged).toHaveLength(4);
+    expect(ws.decisions().filter((d) => d.action === "auto_stage")).toHaveLength(4);
+    expect(ws.decisions().filter((d) => d.action === "remind_staged")).toHaveLength(4);
+  });
+
+  it("keeps the month roll in the resumed report", async () => {
+    const { tick, ladder, store } = await setup("auto");
+    const realGate = ladder.gate;
+    ladder.gate = () => {
+      throw new Error("down");
+    };
+    await expect(tick(at("2027-01-04"))).rejects.toThrow("down");
+    ladder.gate = realGate;
+    const r = await tick(at("2027-01-04", "09:00"));
+    expect(r).toMatchObject({ period: "2027-01", rolled_from: "2026-12" });
+  });
+
+  it("an unfinished day that is never retried does not block the next day", async () => {
+    const { tick, ladder, store } = await setup("auto");
+    const realGate = ladder.gate;
+    let calls = 0;
+    ladder.gate = (cls, unusual) => {
+      if (++calls === 2) throw new Error("down");
+      return realGate(cls, unusual);
+    };
+    await expect(tick(at("2027-01-04"))).rejects.toThrow("down");
+    expect(loadBillBook(store.data)!.partial?.date).toBe("2027-01-04");
+    ladder.gate = realGate;
+    const next = await tick(at("2027-01-05"));
+    expect(next.date).toBe("2027-01-05");
+    expect(next.bills.map((b) => b.id)).toEqual(["K03", "K05", "K08", "K12", "K17"]); // K03 was done on the 4th, but that was another day
+    expect(loadBillBook(store.data)!.partial).toBeUndefined();
+  });
+});
+
+describe("recording a payment", () => {
+  const paidDeps = (t: Awaited<ReturnType<typeof setup>>, when = at("2026-12-02")) => ({ ws: t.ws, store: t.store, outbox: t.outbox, now: () => when });
+
+  it("a paid bill gets no reminder, notice or fee; the next month starts it unpaid again", async () => {
+    const t = await setup("auto");
+    const res = await markBillPaid(paidDeps(t), "K05", "pemilik");
+    expect(res).toMatchObject({ id: "K05", period: "2026-12", paid: true, cancelled: [] });
+    expect(loadBillBook(t.store.data)!.bills.find((b) => b.id === "K05")!.paid).toBe(true);
+    const d = t.ws.decisions().find((x) => x.entry_hash === res.receipt)!;
+    expect(d).toMatchObject({ action: "mark_paid", subject: "K05", agent: "owner" });
+    const msgs = JSON.stringify((await t.ws.conversation(d.agent, d.conversation_id)).messages);
+    expect(msgs).toContain("pemilik");
+
+    const d4 = await t.tick(at("2026-12-04"));
+    expect(d4.bills.map((b) => b.id)).toEqual(["K03", "K08", "K17"]);
+    const d8 = await t.tick(at("2026-12-08"));
+    expect(d8.bills.filter((b) => b.action === "charge_fee").map((b) => b.id)).toEqual(["K03", "K17"]);
+    expect(t.outbox.items().some((i) => i.subject === "K05")).toBe(false);
+
+    const jan = await t.tick(at("2027-01-04"));
+    expect(jan.bills.map((b) => b.id)).toEqual(["K03", "K05", "K08", "K12", "K17"]); // rent is monthly: everyone unpaid again
+  });
+
+  it("is idempotent: the second call records nothing", async () => {
+    const t = await setup("auto");
+    const first = await markBillPaid(paidDeps(t), "K03", "pemilik");
+    const n = t.ws.decisions().length;
+    const second = await markBillPaid(paidDeps(t), "K03", "pemilik");
+    expect(second).toMatchObject({ already: true, paid: true });
+    expect(second.receipt).toBeUndefined();
+    expect(first.receipt).toBeDefined();
+    expect(t.ws.decisions()).toHaveLength(n);
+  });
+
+  it("cancels the bill's reminder that is still in its undo window, without demoting the class", async () => {
+    const t = await setup("auto", { token: "TOKEN", chats: { K08: "808" } });
+    await t.tick(at("2026-12-04"));
+    const res = await markBillPaid(paidDeps(t, at("2026-12-04", "08:05")), "K08", "pemilik");
+    expect(res.cancelled).toHaveLength(1);
+    expect(t.outbox.items().find((i) => i.subject === "K08")).toMatchObject({ status: "undone", undo_receipt: res.receipt });
+    expect(t.ladder.level("reminder")).toBe("auto");
+    const later = await t.tick(at("2026-12-04", "08:11"));
+    expect(later.flushed).toHaveLength(3);
+    expect(t.calls).toEqual([]); // K08 was the only tenant with a chat, and it was cancelled
+  });
+
+  it("refuses an unknown bill and a missing bill book", async () => {
+    const t = await setup("auto");
+    await expect(markBillPaid(paidDeps(t), "K99", "pemilik")).rejects.toBeInstanceOf(UnknownBill);
+    const empty = { data: {}, save() {} };
+    await expect(markBillPaid({ ws: t.ws, store: empty, outbox: t.outbox }, "K05", "pemilik")).rejects.toBeInstanceOf(NoBills);
+  });
+});
+
+describe("due day", () => {
+  it("the live bills, the monthly roll and the contract share one due day (KOS_DUE_DAY)", async () => {
+    expect(KOS_DUE_DAY).toBe(1); // SOP: bills go out on the 1st, the fee counts H+7 from it
+    expect(dueDateWib(at("2026-12-17"))).toBe("2026-12-01");
+    expect(kosDueDate("2027-02")).toBe("2027-02-01");
+    const { tick, store } = await setup("auto");
+    await tick(at("2027-01-04"));
+    const rolled = loadBillBook(store.data)!.bills;
+    expect(rolled.every((b) => Number(b.due.slice(8)) === KOS_DUE_DAY && b.due === "2027-01-01")).toBe(true);
   });
 });
 

@@ -18,7 +18,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  AskBusiness, approveBound, buildRapor, demoBills, monthStartWib, saveBillBook, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
+  AskBusiness, approveBound, buildRapor, demoBills, dueDateWib, saveBillBook, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
   kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
   amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
@@ -232,8 +232,8 @@ if (args.has("--amend")) {
 }
 
 // 6c. What the owner web UI reads: every crew's queue (only the pending ones stay pending) and the ladder,
-// and the live bill set the billing tick runs over: the same five tenants, due on the 1st of this month (Asia/Jakarta).
-const liveBills = saveBillBook(opened.store.data, demoBills(monthStartWib(Date.now())));
+// and the live bill set the billing tick runs over: the same five tenants, due on the due day (KOS_DUE_DAY) of this month (Asia/Jakarta).
+const liveBills = saveBillBook(opened.store.data, demoBills(dueDateWib(Date.now())));
 say(`live bills: ${liveBills.bills.length} tenants (${liveBills.bills.filter((b) => !b.paid).length} unpaid) due ${liveBills.bills[0]!.due}; POST /api/meko/tick runs rentTick over them`);
 saveReview(opened.store.data, [...b.state.queue, ...c.state.queue]);
 saveLadderState(opened.store.data, ladder.state);
