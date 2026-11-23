@@ -11,7 +11,10 @@ export interface ExecResult {
   ok: boolean;
   /** "log" when the Log connector recorded it instead of a real app. */
   via: string;
+  /** The real app's id for what it created (a calendar event id), when it gave one. */
   ref?: string;
+  /** Why a real attempt failed (ok is false). Never carries a key. */
+  error?: string;
 }
 
 /** Words a brief; must return plain text. Usage is metered against the playbook budget. */
