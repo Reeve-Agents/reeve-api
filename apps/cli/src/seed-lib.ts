@@ -3,11 +3,26 @@
 //   - which sandbox the Auditor's planted defects run in (the same factory the API uses: REEVE_SANDBOX)
 //   - which anchor the ledger's Merkle root gets: a real testnet transaction when the anchor wallet is
 //     configured, otherwise a local Merkle root that says so, or none with --no-anchor.
+//   - whether viewings can be booked on the owner's Google Calendar (Composio), else they stay on the Log.
 import { anchorFromEnv, CHAINS, type AnchorResult } from "@reeve/anchor";
+import { connectorsFromEnv } from "@reeve/connectors";
+import type { CalendarRegistry } from "@reeve/crew";
 import { anchorLeaves, merkleRoot, type LedgerBody, type LedgerEntry } from "@reeve/receipts";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 
 export type SandboxKind = "createos" | "local";
+
+/**
+ * The connector registry the seed books viewings with. Without a Composio key, or with --no-calendar,
+ * there is none and every viewing stays on the Log connector. With one, the registry is only asked about
+ * Google Calendar when a viewing is booked: the seed's one real side effect, an event on the owner's own
+ * calendar (no attendees, no invitation), and only if Google Calendar is connected in Composio.
+ */
+export function seedCalendar(env: NodeJS.ProcessEnv = process.env, opts: { skip?: boolean; make?: (env: NodeJS.ProcessEnv) => CalendarRegistry } = {}): { registry: CalendarRegistry | null; note: string } {
+  if (opts.skip) return { registry: null, note: "calendar: Log only (--no-calendar); viewings are recorded, not booked" };
+  if (!(env.COMPOSIO_API_KEY ?? env.COMPOSIO_CONSUMER_API_KEY)?.trim()) return { registry: null, note: "calendar: Log only (no COMPOSIO_API_KEY); viewings are recorded, not booked" };
+  return { registry: (opts.make ?? connectorsFromEnv)(env), note: "calendar: viewings are booked on Google Calendar via Composio if it is connected, else recorded on the Log (--no-calendar keeps the Log)" };
+}
 
 /** The Auditor's sandbox: REEVE_SANDBOX=createos runs the mutants in a CreateOS microVM; `flag` (--sandbox=) overrides it. */
 export function seedSandbox(env: NodeJS.ProcessEnv = process.env, flag?: string): { sandbox: Sandbox; kind: SandboxKind } {

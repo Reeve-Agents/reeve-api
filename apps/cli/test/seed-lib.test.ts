@@ -5,7 +5,7 @@ import { CHAINS } from "@reeve/anchor";
 import { anchorLeaves, Ledger, merkleRoot } from "@reeve/receipts";
 import { mainnet } from "viem/chains";
 import { describe, expect, it } from "vitest";
-import { type AnchorSubmitter, chooseAnchor, preflightAnchor, seedSandbox, writeSeedAnchor } from "../src/seed-lib";
+import { type AnchorSubmitter, chooseAnchor, preflightAnchor, seedCalendar, seedSandbox, writeSeedAnchor } from "../src/seed-lib";
 
 const ledgerWithReceipts = (n = 3) => {
   const ledger = new Ledger(join(mkdtempSync(join(tmpdir(), "seed-lib-")), "ledger.jsonl"));
@@ -113,5 +113,27 @@ describe("seed anchor selection", () => {
     const ledger = ledgerWithReceipts();
     await expect(writeSeedAnchor(ledger, choice)).rejects.toThrow(/rpc down/);
     expect(ledger.entries().some((e) => e.kind === "anchor")).toBe(false);
+  });
+});
+
+describe("seed calendar", () => {
+  const fake = { list: () => [], appStatus: async () => ({}), execute: async () => ({ ok: true, connector: "composio" }) };
+
+  it("is Log only without a Composio key or with --no-calendar, and never builds a registry", () => {
+    let built = 0;
+    const make = () => (built++, fake);
+    expect(seedCalendar({}, { make })).toMatchObject({ registry: null, note: expect.stringMatching(/no COMPOSIO_API_KEY.*not booked/) });
+    expect(seedCalendar({ COMPOSIO_API_KEY: "  " }, { make }).registry).toBeNull();
+    expect(seedCalendar({ COMPOSIO_API_KEY: "ck_test" }, { skip: true, make })).toMatchObject({ registry: null, note: expect.stringMatching(/--no-calendar/) });
+    expect(built).toBe(0);
+  });
+
+  it("with a key, builds the registry from the environment; Google Calendar is only asked about at booking time", () => {
+    const seen: NodeJS.ProcessEnv[] = [];
+    const env = { COMPOSIO_API_KEY: "ck_test" };
+    const r = seedCalendar(env, { make: (e) => (seen.push(e), fake) });
+    expect(r.registry).toBe(fake);
+    expect(seen).toEqual([env]);
+    expect(r.note).toMatch(/Google Calendar via Composio if it is connected, else recorded on the Log/);
   });
 });

@@ -5,6 +5,7 @@
 //   npm run meko:seed -- --local --fresh       # rehearsal on local Meko (`meko start`), demo datapack reset
 //   npm run meko:seed -- --llm                 # Worker drafts on Claude Haiku 5.5 (costs a few cents)
 //   npm run meko:seed -- --no-anchor           # no anchor entry (default: a testnet tx when REEVE_ANCHOR_PRIVATE_KEY is set, else a local Merkle root)
+//   npm run meko:seed -- --no-calendar         # keep viewings on the Log (default: a real Google Calendar event when COMPOSIO_API_KEY has Calendar connected)
 //   REEVE_SANDBOX=createos npm run meko:seed   # the Auditor's planted defects run in a CreateOS microVM (CREATEOS_API_KEY)
 //
 // It checks the endpoint and its tools first, then runs `crew:demo` with the same flags and prints

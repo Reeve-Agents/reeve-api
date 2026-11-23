@@ -1,7 +1,7 @@
 // Playbook B "kamar kosong terisi sendiri": vacancy -> listing -> CS on whitelisted intents ->
 // viewing -> deposit bill (test-mode rail) -> contract draft -> owner passkey. Each step is a
 // receipt and a Meko turn; each prospect's history is Meko memory under a pseudonym.
-import { Crew, CrewError, type PasskeyProof, type ReviewItem } from "./crew";
+import { Crew, CrewError, type ExecResult, type PasskeyProof, type ReviewItem } from "./crew";
 import { KOS_DEPOSIT_IDR, KOS_FACILITIES, KOS_FACTS, KOS_LOCATION, KOS_RENT_IDR, kosListingDraft } from "./kos";
 import { KOS_WHITELIST } from "./playbook";
 import { KOS_RENT_CARDS, lateFeeContractClause, rentDueContractClause } from "./tagihan";
@@ -183,21 +183,54 @@ export class KamarKosong extends Crew {
     return { intent, replied: true, reply };
   }
 
-  /** b3: book the viewing slot (Calendar connector, else the Log). */
-  async bookViewing(prospectId: string, slot: string): Promise<void> {
+  /**
+   * b3: book the viewing slot: a Google Calendar event through Composio when the owner's calendar is
+   * connected, else the Log connector (recorded, not booked). If the calendar call fails the slot is not
+   * held, the failure is a traced decision and the owner gets a review item.
+   */
+  async bookViewing(prospectId: string, slot: string): Promise<{ booked: boolean; via: string; ref?: string; error?: string }> {
     const step = this.step("b3_viewing");
     const p = this.prospects[prospectId]!;
     if (this.booked.includes(slot)) throw new CrewError(`slot ${slot} is taken`);
+    // Hold the slot while the calendar answers, so a second prospect cannot be given the same one.
     p.viewing = slot;
-    const res = await this.exec(step, { title: `Survei kamar ${p.room}: ${p.alias}`, start: slot, duration_min: 30 });
+    const res: ExecResult = await this.exec(step, { title: `Survei kamar ${p.room}: ${p.alias}`, start: slot, duration_min: 30 }).catch(
+      (e): ExecResult => ({ ok: false, via: step.publish!.connector, error: e instanceof Error ? e.message : String(e) }),
+    );
     const op = await this.agent("operator", `CS: ${p.alias}`);
+    const input = `viewing_requested: ${p.alias}, kamar ${p.room}`;
+    if (!res.ok) {
+      delete p.viewing;
+      const error = (res.error ?? "unknown error").slice(0, 200);
+      const failed = await this.record(op, {
+        input,
+        output: { action: "book_viewing_failed", slot, via: res.via, error },
+        reasoning: `Booking ${slot} in Google Calendar via ${res.via === "composio" ? "Composio" : res.via} failed: ${error}. The slot is not held and ${p.alias} has no confirmed viewing, so the owner is asked to book it by hand.`,
+        action: "book_viewing_failed",
+        action_class: step.action_class,
+      });
+      this.queue({
+        step: step.id,
+        kind: "action",
+        subject: p.alias,
+        text: `Survei kamar ${p.room} pada ${slot} belum masuk Google Calendar (${error}). ${p.alias} sudah diberi tahu slot itu: atur sendiri atau hubungi.`,
+        receipt: failed.receipt_hash,
+        meta: { prospect: prospectId, slot, via: res.via, error },
+      });
+      return { booked: false, via: res.via, error };
+    }
     await this.record(op, {
-      input: `viewing_requested: ${p.alias}, kamar ${p.room}`,
-      output: { action: "book_viewing", slot, via: res.via },
-      reasoning: `The first free slot Monday-Saturday 10.00-16.00 is ${slot}; no other viewing holds it.`,
+      input,
+      output: { action: "book_viewing", slot, via: res.via, ...(res.ref ? { ref: res.ref } : {}) },
+      reasoning: `The first free slot Monday-Saturday 10.00-16.00 is ${slot}; no other viewing holds it. ${
+        res.via === "log"
+          ? "Log connector: recorded, not booked, until Google Calendar is connected."
+          : `The event is created in Google Calendar via ${res.via === "composio" ? "Composio" : res.via}${res.ref ? ` (event ${res.ref})` : ""}.`
+      }`,
       action: "book_viewing",
       action_class: step.action_class,
     });
+    return { booked: res.via !== "log", via: res.via, ...(res.ref ? { ref: res.ref } : {}) };
   }
 
   /** b4: after the viewing the prospect wants the room; bill the deposit if it fits the bound. */

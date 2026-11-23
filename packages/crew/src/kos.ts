@@ -50,7 +50,7 @@ export function playbookB(startsOn = "2026-12-01", by = "2026-12-31"): Playbook 
       {
         id: "b3_viewing", title: "Atur jadwal survei", source_quote: "atur survei", when: "viewing_requested", emits: ["viewing_done"],
         trigger: { event: "viewing_requested" }, recipe: { skill: "book_viewing", brief: "Slot survei 10.00-17.00, Senin-Sabtu", inputs: ["calendar"] },
-        checks: [], review: "auto_if_whitelisted_intent", publish: { connector: "log", tool: "GOOGLECALENDAR_CREATE_EVENT" }, budget: worker(0), action_class: "book_viewing",
+        checks: [], review: "auto_if_whitelisted_intent", publish: { connector: "composio", tool: "GOOGLECALENDAR_CREATE_EVENT" }, budget: worker(0), action_class: "book_viewing",
       },
       {
         id: "b4_deposit", title: "Tagih deposit", source_quote: "tagih deposit Rp500.000", when: "viewing_done", emits: ["deposit_paid"],

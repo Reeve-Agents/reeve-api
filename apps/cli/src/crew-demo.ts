@@ -5,6 +5,10 @@
 // message is sent (Log connector), the rail is the mock or Xendit test mode, and the owner's passkey is
 // marked "demo". It also writes the five demo tenants' bills for the live billing tick (POST /api/meko/tick).
 //
+// One real side effect: with COMPOSIO_API_KEY and Google Calendar connected in Composio, each booked viewing
+// (Playbook B, step b3) is a real event on the owner's own calendar (no attendees, no invitation). Without
+// either, or with `--no-calendar`, viewings are recorded on the Log connector, not booked.
+//
 // The anchor: with REEVE_ANCHOR_PRIVATE_KEY (and REEVE_ANCHOR_CHAIN, a testnet) the ledger's Merkle root
 // is published as a real testnet transaction; without it the root is only a local Merkle root, said so.
 // `--no-anchor` skips it; `--sandbox=local|createos` overrides REEVE_SANDBOX.
@@ -13,13 +17,14 @@
 //   npm run crew:demo -- --llm          # Worker on Claude Haiku 5.5 (needs ANTHROPIC_API_KEY)
 //   npm run crew:demo -- --amend        # also seed repeated owner exceptions and one pending SOP amendment
 //                                       # (run the API with REEVE_SOP_AMENDMENTS=on to see it)
+//   npm run crew:demo -- --no-calendar  # keep viewings on the Log even if Google Calendar is connected
 //   npm run crew:demo -- --fresh        # drop the demo datapack and ledger first
 //   npm run crew:demo -- --ledger=pg    # ledger in Postgres (DATABASE_URL), as the deployed API reads it
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   AskBusiness, approveBound, buildRapor, demoBills, dueDateWib, saveBillBook, KamarKosong, KontenLoop, KOS_PLAN_BOUND, Ladder, negotiate, newState, Outbox, playbookB, playbookC, raporHtml, rentTick, saveLadderState, saveReview, storeRapor,
-  kosDiscoverySample, parsePaymentsCsv, SopDiscovery,
+  kosDiscoverySample, parsePaymentsCsv, SopDiscovery, withCalendar,
   amendSampleHistory, loadExceptions, recordException, scanAmendments,
   type ExecResult, type TenantBill, type WorkerFn,
 } from "@reeve/crew";
@@ -28,7 +33,7 @@ import { AnthropicProvider } from "@reeve/llm";
 import { connectMeko, mekoEndpointFromEnv, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import { kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, repoRoot, runAttempt } from "@reeve/pipeline";
 import { MockRail } from "@reeve/rails";
-import { chooseAnchor, preflightAnchor, seedSandbox, writeSeedAnchor } from "./seed-lib";
+import { chooseAnchor, preflightAnchor, seedCalendar, seedSandbox, writeSeedAnchor } from "./seed-lib";
 
 const args = new Set(process.argv.slice(2));
 const WS = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
@@ -69,10 +74,14 @@ const ws = await MekoWorkspace.open(meko, { workspace: WS, ledger, pseudonyms: n
 say(`datapack ${MekoWorkspace.datapackName(WS)} = ${ws.datapackId}`);
 
 const logged: { tool: string; args: Record<string, unknown> }[] = [];
-const execute = async (_connector: string, tool: string, a: Record<string, unknown>): Promise<ExecResult> => {
+const logExecute = async (_connector: string, tool: string, a: Record<string, unknown>): Promise<ExecResult> => {
   logged.push({ tool, args: a });
   return { ok: true, via: "log" };
 };
+// Everything goes to the Log, except the viewing: with Google Calendar connected in Composio it is a real event on the owner's calendar.
+const cal = seedCalendar(process.env, { skip: args.has("--no-calendar") });
+say(cal.note);
+const { execute, stats: calendar } = withCalendar({ registry: cal.registry, fallback: logExecute, say });
 
 let worker: WorkerFn | undefined;
 if (args.has("--llm")) {
@@ -254,10 +263,12 @@ const stored = await storeRapor(ws, rapor);
 writeFileSync(join(dir, "rapor.html"), raporHtml(rapor));
 writeFileSync(join(dir, "rapor.json"), JSON.stringify(rapor, null, 2));
 const metrics = (await meko.call("datapack_metrics", { conversation_id: ws.setupConversation, datapack_id: ws.datapackId, days: 30 }).catch(() => null)) as { context_efficiency?: { tokens_saved: number; tokens_sent: number; saved_pct: number }; searches?: number } | null;
-say(`\n${all.length} traced decisions, ${ok} verified against Meko; ${logged.length} connector calls logged (not sent)`);
+say(`\n${all.length} traced decisions, ${ok} verified against Meko; ${logged.length} connector calls logged (not sent); Google Calendar: ${calendar.created} events created, ${calendar.failed} failed`);
 say(`rapor artifact ${stored.content_hash.slice(0, 16)}… -> ${join(dir, "rapor.html")}`);
 if (metrics?.context_efficiency) say(`context_search: ${metrics.searches} searches, ${metrics.context_efficiency.tokens_sent} tokens sent, ${metrics.context_efficiency.tokens_saved} saved (${metrics.context_efficiency.saved_pct}%)`);
 say(`input saved vs full context (Reeve ledger, ${rapor.savings.events} Operator events): ${rapor.savings.saved} of ${rapor.savings.baseline_input} baseline tokens${rapor.savings.ratio ? ` (${rapor.savings.ratio}x)` : ""}; Reeve side ${rapor.savings.reeve_input_basis.billed} billed + ${rapor.savings.reeve_input_basis.estimated} estimated`);
 say(`LLM tokens: ${rapor.tokens.llm_input} in / ${rapor.tokens.llm_output} out over ${rapor.tokens.worker_calls} Worker calls`);
 await meko.close();
 await persistence?.close();
+// Composio's MCP connection has no close on the registry and can keep the process alive after it was used.
+if (calendar.touched) process.exit(0);
