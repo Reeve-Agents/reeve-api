@@ -4,6 +4,7 @@
 import { Crew, CrewError, type PasskeyProof, type ReviewItem } from "./crew";
 import { KOS_DEPOSIT_IDR, KOS_FACILITIES, KOS_FACTS, KOS_LOCATION, KOS_RENT_IDR, kosListingDraft } from "./kos";
 import { KOS_WHITELIST } from "./playbook";
+import { KOS_RENT_CARDS, lateFeeContractClause } from "./tagihan";
 import { AI_LABEL } from "./validator";
 
 export type Intent = (typeof KOS_WHITELIST)[number] | "nego" | "keluhan" | "refund" | "minta_pemilik" | "tidak_jelas";
@@ -245,8 +246,8 @@ export class KamarKosong extends Crew {
     const contract = [
       `PERJANJIAN SEWA KAMAR KOS MELATI`,
       `Penyewa: ${p.alias}. Kamar: ${p.room}. Mulai: ${this.today()}.`,
-      `Sewa Rp1.500.000 per bulan, dibayar paling lambat tanggal 5. Deposit Rp500.000 sudah diterima (${inv.invoiceId}).`,
-      `Telat bayar lebih dari 7 hari dikenai denda Rp50.000, kecuali ada izin pemilik.`,
+      `Sewa Rp${KOS_RENT_CARDS.rent_idr.toLocaleString("id-ID")} per bulan, dibayar paling lambat tanggal 5. Deposit Rp500.000 sudah diterima (${inv.invoiceId}).`,
+      lateFeeContractClause(KOS_RENT_CARDS),
       `(${AI_LABEL}; diperiksa pemilik sebelum ditandatangani)`,
     ].join("\n");
     const op = await this.agent("operator", `CS: ${p.alias}`);

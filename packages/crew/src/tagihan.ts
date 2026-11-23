@@ -19,6 +19,17 @@ export const KOS_RENT_CARDS: RentCards = {
   rent_idr: 1_500_000,
 };
 
+/** The late fee in rupiah, from the rule: percent of the rent, once per bill. rentTick charges exactly this. */
+export function lateFeeIdr(cards: RentCards = KOS_RENT_CARDS): number {
+  return Math.round((cards.rent_idr * cards.late_fee.percent) / 100);
+}
+
+/** The contract's late-fee sentences, generated from the rule so they cannot disagree with what rentTick charges. */
+export function lateFeeContractClause(cards: RentCards = KOS_RENT_CARDS): string {
+  const lf = cards.late_fee;
+  return `Belum lunas pada H+${lf.days_after_due} sesudah jatuh tempo dikenai denda ${lf.percent}% dari sewa (Rp${lateFeeIdr(cards).toLocaleString("id-ID")}), cuma sekali per tagihan, kecuali ada izin pemilik. Penghuni yang sudah tinggal minimal ${lf.tenure_grace.min_months} bulan dapat toleransi ${lf.tenure_grace.extra_days} hari tambahan.`;
+}
+
 export interface TenantBill {
   /** Pseudonymous id ("K03"); the name never leaves Reeve. */
   id: string;
@@ -81,7 +92,7 @@ export async function rentTick(run: MekoRun, bills: TenantBill[], today: string,
       continue;
     }
     if (wantsFee) {
-      const amount = Math.round((cards.rent_idr * cards.late_fee.percent) / 100);
+      const amount = lateFeeIdr(cards);
       const d = await op.decide({
         input: `${b.id} kamar ${b.room}: jatuh tempo ${b.due}, hari ini ${today}, telat ${late} hari, tinggal ${b.tenure_months} bulan`,
         output: { action: "charge_fee", amount_idr: amount, rule: "R3 late_fee" },
