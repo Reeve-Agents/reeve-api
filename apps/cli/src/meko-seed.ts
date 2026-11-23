@@ -56,7 +56,7 @@ Done. For the deployed API (CreateOS reeve-api, branch main), set these environm
   TELEGRAM_BOT_USERNAME   bot name for the tenant link (t.me/<name>?start=<code>)
   REEVE_MEKO_PUBLIC_ASK   "on" only if the public Tanya usaha box should accept questions
 For the live billing tick (POST /api/meko/tick; the seed wrote the demo bills):
-  REEVE_TICK_SECRET       long random value for x-reeve-tick-secret (cron callers); without it only the owner session can tick
+  REEVE_TICK_SECRET       long random value for x-reeve-tick-secret (POST /api/meko/tick and /api/meko/bills/:id/paid); without it both routes answer 401
   REEVE_MEKO_TICK         "on" runs the tick after start-up and daily at about 08:00 WIB inside the API
   TELEGRAM_BOT_TOKEN      reminders go to tenants' linked Telegram chats; without it they go to the Log connector (recorded, not sent)
 The API must read the same ledger: seed with --ledger=pg for the deployment.`);

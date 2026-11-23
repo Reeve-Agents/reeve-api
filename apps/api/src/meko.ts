@@ -2,7 +2,7 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, buildDigest, liveTick, NoBills, type TickReport, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, liveTick, markBillPaid, type MarkPaidResult, NoBills, type TickReport, UnknownBill, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -435,6 +435,9 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     return ticking;
   };
 
+  /** The owner records that a tenant paid this month (POST /api/meko/bills/:id/paid): the bill leaves the loop, the decision is traced. */
+  const markPaid = async (id: string, who: string): Promise<MarkPaidResult> => markBillPaid({ ws: await open(), store: needStore(), outbox: await getOutbox(), now: clock }, id, who);
+
   return {
     app,
     fetch: (req: Request, account: string) => app.fetch(req, { account }),
@@ -442,6 +445,7 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     digestText: async () => (await digestFor()).text,
     /** One billing tick for today in Asia/Jakarta; idempotent per day (POST /api/meko/tick, the scheduler). */
     tick,
+    markPaid,
     /** Runs staged reminders whose 10-minute window has passed (the scheduler calls this every minute). */
     flush: async () => {
       await settled();
@@ -452,22 +456,43 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
 const sha = (v: string) => createHash("sha256").update(v).digest();
 
 /**
- * POST /api/meko/tick: the live billing loop. Either the signed-in owner (the account layer passes the
- * session's account) or the header `x-reeve-tick-secret` equal to REEVE_TICK_SECRET (constant-time
- * compare). Without the env only the owner session works. Called as `fetch(req, account | null)`.
+ * The live billing loop's two secret-protected routes. Both cause real effects (a tick can send Telegram
+ * messages; marking a bill paid stops them), so neither takes a session: there is no per-workspace owner for
+ * this shared demo workspace, and any self-registered account could otherwise call them. The caller sends
+ * the header `x-reeve-tick-secret` equal to REEVE_TICK_SECRET (constant-time compare); without the env both
+ * routes answer 401 to everyone (the in-process scheduler, REEVE_MEKO_TICK=on, still ticks).
+ * - POST /api/meko/tick: today's tick over the stored bills.
+ * - POST /api/meko/bills/:id/paid: records that tenant :id (K05) paid this month.
+ * Served without a session, as `fetch(req)`.
  */
-export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; secret?: string }) {
-  const app = new Hono<{ Bindings: { account: string | null } }>().basePath("/api/meko");
+export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; markPaid: (id: string, by: string) => Promise<MarkPaidResult>; secret?: string }) {
+  const app = new Hono().basePath("/api/meko");
+  const allowed = (header: string | undefined) => !!deps.secret && !!header && timingSafeEqual(sha(header), sha(deps.secret));
+  const denied = { error: "Kirim header x-reeve-tick-secret yang benar." };
+  const generic = (what: string, e: unknown) => {
+    console.error(`meko ${what} failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
+    return { error: `${what === "tick" ? "Tick" : "Menandai lunas"} gagal dijalankan. Coba lagi sebentar lagi; rinciannya ada di log server.` };
+  };
   app.post("/tick", async (c) => {
-    const sent = c.req.header("x-reeve-tick-secret");
-    const bySecret = !!deps.secret && !!sent && timingSafeEqual(sha(sent), sha(deps.secret));
-    if (!bySecret && !c.env?.account) return c.json({ error: "Masuk sebagai pemilik, atau kirim header x-reeve-tick-secret." }, 401);
+    if (!allowed(c.req.header("x-reeve-tick-secret"))) return c.json(denied, 401);
     try {
       return c.json(await deps.tick());
     } catch (e) {
       if (e instanceof NoBills) return c.json({ error: e.message }, 409);
-      return c.json({ error: `Tick gagal: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}` }, 503);
+      return c.json(generic("tick", e), 503);
     }
   });
-  return { app, fetch: (req: Request, account: string | null) => app.fetch(req, { account }) };
+  app.post("/bills/:id/paid", async (c) => {
+    if (!allowed(c.req.header("x-reeve-tick-secret"))) return c.json(denied, 401);
+    const id = c.req.param("id").toUpperCase();
+    if (!/^K\d{2,3}$/.test(id)) return c.json({ error: "Kode penghuni harus seperti K05." }, 400);
+    try {
+      return c.json(await deps.markPaid(id, "pemilik (lewat kunci server)"));
+    } catch (e) {
+      if (e instanceof NoBills) return c.json({ error: e.message }, 409);
+      if (e instanceof UnknownBill) return c.json({ error: e.message }, 404);
+      return c.json(generic("mark paid", e), 503);
+    }
+  });
+  return { app, fetch: (req: Request) => app.fetch(req) };
 }

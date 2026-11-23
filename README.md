@@ -105,24 +105,26 @@ Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/
 
 ### Live billing tick (`POST /api/meko/tick`)
 
-The seed also writes the five Kos Melati demo tenants' bills into the workspace store (K03, K05, K08 and K17 unpaid, K12 paid, with their tenure), due on the 1st of the month it ran in (Asia/Jakarta). The deployed API runs the same `rentTick` over them, so the demo has a loop that keeps going after the seed.
+The seed also writes the five Kos Melati demo tenants' bills into the workspace store (K03, K05, K08 and K17 unpaid, K12 paid, with their tenure), due on the 1st of the month it ran in (Asia/Jakarta). The due day is one constant (`KOS_DUE_DAY = 1`, the SOP's "tagihan dikirim setiap tanggal 1"): the live bills, the monthly roll and the generated contract ("jatuh tempo setiap tanggal 1") all read it, and the late fee counts H+7 from it. The deployed API runs the same `rentTick` over them, so the demo has a loop that keeps going after the seed.
 
 | What | How |
 |---|---|
-| `POST /api/meko/tick` | Runs today's tick (today = the date in Asia/Jakarta) over the stored bills, saves the bill state, and answers with what it did per bill (`remind`, `notice`, `charge_fee`, `hold`, `none`, and the decision recorded) plus the receipts. **Idempotent per day**: a second call the same day stages and records nothing new for the bills and returns the first result with `repeated: true`. It only runs staged reminders whose 10-minute window has passed. |
-| Auth | A signed-in owner, or the header `x-reeve-tick-secret` equal to `REEVE_TICK_SECRET` (constant-time compare). Otherwise 401. With `REEVE_TICK_SECRET` unset only the owner session works. 409 when the seed wrote no bills. |
-| `REEVE_MEKO_TICK=on` | In-process scheduler: one tick shortly after start-up, then one every day at about 08:00 WIB, and a minute timer that runs staged reminders once their window has passed. Safe with restarts (per-day idempotency). Without it, call the route from a cron with the secret. |
+| `POST /api/meko/tick` | Runs today's tick (today = the date in Asia/Jakarta) over the stored bills, saves the bill state, and answers with what it did per bill (`remind`, `notice`, `charge_fee`, `hold`, `none`, and the decision recorded) plus the receipts. **Idempotent per day**: a second call the same day stages and records nothing new for the bills and returns the first result with `repeated: true`. **Resumable**: each bill's progress is saved as soon as it is done, so a tick that failed midway (the route answered 503) is finished by calling it again the same day, without staging any reminder twice. It only runs staged reminders whose 10-minute window has passed. |
+| `POST /api/meko/bills/:id/paid` | The owner records that tenant `:id` (K05) paid this month's rent. The bill gets no reminder, notice or fee until the next month, a reminder of it still in its 10-minute window is cancelled, and the decision (`mark_paid`) is a Meko trace and a ledger receipt. Calling it again records nothing (`already: true`). A new month starts every bill unpaid again (rent is monthly). 404 for an unknown bill. |
+| Auth | Both routes need the header `x-reeve-tick-secret` equal to `REEVE_TICK_SECRET` (constant-time compare), and **no session is accepted**: they cause sends, and any self-registered account could otherwise call them. Otherwise 401, and with `REEVE_TICK_SECRET` unset both are 401 for everyone. 409 when the seed wrote no bills. Errors answer with a generic message; the detail goes to the server log. |
+| `REEVE_MEKO_TICK=on` | In-process scheduler: one tick shortly after start-up (only when it is 08:00 WIB or later and today's tick is not done; a start at night waits for 08:00 WIB), then one every day at about 08:00 WIB, and a minute timer that runs staged reminders once their window has passed. Safe with restarts (per-day idempotency). Without it, call the route from a cron with the secret. **Run one API instance**: the day's claim lives in that process's copy of the store, so two instances ticking the same day would both run it. |
 | `TELEGRAM_BOT_TOKEN` | A reminder that runs is sent with the Bot API `sendMessage` to the tenant's linked Telegram chat and recorded `via: "telegram"`. No token, or the tenant has no linked chat: `via: "log"`. A Telegram error is recorded as a failed run, never as sent. |
-| `REEVE_TICK_SECRET` | Secret for cron callers (above). Set it as a long random value; it is never logged. |
+| `REEVE_TICK_SECRET` | Secret for the two routes above (cron, and the owner's "sudah bayar" call). Set it as a long random value; it is never logged. |
 
 ```bash
 curl -X POST https://<api>/api/meko/tick -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
+curl -X POST https://<api>/api/meko/bills/K05/paid -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
 ```
 
-Rules it follows: the **autonomy ladder** decides. While "Pengingat" is at `ask` (the default) a due reminder is recorded as `ask_owner` and nothing is staged; once the owner moves it up, a reminder is **staged for 10 minutes** (undo in the owner app) and only then sent. A month that starts rolls the bills to its 1st: nobody has paid yet, no fee charged, tenure one month longer.
+Rules it follows: the **autonomy ladder** decides. While "Pengingat" is at `ask` (the default) a due reminder is recorded as `ask_owner` and nothing is staged; once the owner moves it up, a reminder is **staged for 10 minutes** (undo in the owner app) and only then sent. A month that starts rolls the bills to its due day (the 1st): nobody has paid yet, no fee charged, tenure one month longer.
 
 **Live**: the daily tick over stored bills, every decision a Meko trace and a ledger receipt, the ladder and the 10-minute undo, and Telegram reminders to tenants who linked a chat.
-**Still log or demo**: tenants without a linked Telegram chat (and every WhatsApp message) go to the Log connector, which records and does not send; late fees are recorded decisions only, nothing is charged or collected; the bills' paid flags are the seed's (no payment rail is read for them, a new month starts everyone unpaid); the seed's owner approvals are marked `demo`; the seed's deposit uses a mock rail.
+**Still log or demo**: tenants without a linked Telegram chat (and every WhatsApp message) go to the Log connector, which records and does not send; late fees are recorded decisions only, nothing is charged or collected; a bill is paid only because the owner said so (`POST /api/meko/bills/:id/paid`; no payment rail is read for it) and a new month starts everyone unpaid; the seed's owner approvals are marked `demo`; the seed's deposit uses a mock rail.
 
 ### Measured on Kos Melati (local Meko 1.20261116.0, 21 Nov 2026, `crew:demo --llm`)
 

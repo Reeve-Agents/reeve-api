@@ -10,7 +10,7 @@ import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
 import { createMekoApp, createMekoOwnerApp, createMekoTickApp, mekoOpener } from "./meko";
-import { digestSenderFromEnv, liveExecutor } from "@reeve/crew";
+import { digestSenderFromEnv, liveExecutor, loadBillBook, wibDate } from "@reeve/crew";
 import { startMekoTicker } from "./meko-ticker";
 import { mekoTelegram } from "./meko-telegram";
 import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
@@ -88,15 +88,19 @@ const mekoOwner = createMekoOwnerApp(
   },
   mekoOpen,
 );
-// POST /api/meko/tick: the live billing loop. A signed-in owner, or x-reeve-tick-secret = REEVE_TICK_SECRET.
-const mekoTick = createMekoTickApp({ tick: mekoOwner.tick, secret: process.env.REEVE_TICK_SECRET || undefined });
+// POST /api/meko/tick and POST /api/meko/bills/:id/paid: the live billing loop. Secret only (x-reeve-tick-secret = REEVE_TICK_SECRET), no session.
+const mekoTick = createMekoTickApp({ tick: mekoOwner.tick, markPaid: mekoOwner.markPaid, secret: process.env.REEVE_TICK_SECRET || undefined });
 
 const { app, openAll } = await createAccountsApp({
   persistence,
-  publicApps: [{ prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) }],
+  publicApps: [
+    { prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) },
+    // Served without a session; each route checks the tick secret itself.
+    { prefix: "/api/meko/tick", fetch: (req) => mekoTick.fetch(req) },
+    { prefix: "/api/meko/bills/", fetch: (req) => mekoTick.fetch(req) },
+  ],
   webhookFirst: (req) => (new URL(req.url).pathname === "/api/webhooks/telegram" ? mekoTg.handle(req) : Promise.resolve(null)),
   ownerApps: [{ prefix: "/api/meko/owner/", fetch: (req, account) => mekoOwner.fetch(req, account) }],
-  optionalSessionApps: [{ prefix: "/api/meko/tick", fetch: (req, account) => mekoTick.fetch(req, account) }],
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
   supabase,
@@ -145,9 +149,9 @@ if (scheduler.enabled) {
   console.log(`scheduler on: one business day every ${scheduler.daySeconds}s, checked every ${scheduler.tickMs}ms`);
 }
 
-// REEVE_MEKO_TICK=on: run the billing tick once after start-up, then every day at about 08:00 WIB.
+// REEVE_MEKO_TICK=on: run the billing tick after start-up (only from 08:00 WIB, and not again once today's is done), then every day at about 08:00 WIB. One API instance only (see liveTick).
 if (process.env.REEVE_MEKO_TICK === "on") {
-  startMekoTicker({ tick: () => mekoOwner.tick().then((r) => console.log(`meko tick ${r.date}: ${r.repeated ? "already done today" : r.note}`)), flush: () => mekoOwner.flush() });
+  startMekoTicker({ isDone: () => !!loadBillBook(mekoStore.store.data)?.ticks[wibDate(Date.now())], tick: () => mekoOwner.tick().then((r) => console.log(`meko tick ${r.date}: ${r.repeated ? "already done today" : r.note}`)), flush: () => mekoOwner.flush() });
   console.log(`meko tick on: after start-up and daily at about 08:00 WIB; reminders go via ${botToken ? "Telegram (tenants who linked a chat), else the Log connector" : "the Log connector (set TELEGRAM_BOT_TOKEN to send)"}`);
 }
 

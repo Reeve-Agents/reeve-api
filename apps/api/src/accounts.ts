@@ -52,14 +52,12 @@ export interface AccountDeps {
   sessionSecret?: string;
   /** Supabase Auth for the magic-link backup (project URL and a secret or service-role key). */
   supabase?: { url: string; key: string } | null;
-  /** Read-only public apps served without a session, by path prefix (the Meko demo workspace). */
+  /** Apps served without a session, by path prefix: the read-only Meko demo workspace, and the secret-gated billing tick (each route checks its own secret). */
   publicApps?: { prefix: string; fetch: (req: Request) => Response | Promise<Response> }[];
   /** Tried before the workspaces for an inbound webhook (the Meko demo's Telegram tenants); null passes it on. */
   webhookFirst?: (req: Request) => Promise<Response | null>;
   /** Apps outside the workspace that still need a signed-in owner, by path prefix (Meko owner actions). */
   ownerApps?: { prefix: string; fetch: (req: Request, account: string) => Response | Promise<Response> }[];
-  /** Apps that take a signed-in owner OR their own credential (a secret header): they get the session's account id, or null without one, and decide. */
-  optionalSessionApps?: { prefix: string; fetch: (req: Request, account: string | null) => Response | Promise<Response> }[];
 }
 
 const COOKIE = "reeve_session";
@@ -292,8 +290,6 @@ export async function createAccountsApp(deps: AccountDeps) {
     }
     const pub = deps.publicApps?.find((p) => c.req.path.startsWith(p.prefix));
     if (pub) return pub.fetch(c.req.raw);
-    const mixed = deps.optionalSessionApps?.find((p) => c.req.path.startsWith(p.prefix));
-    if (mixed) return mixed.fetch(c.req.raw, sessionAccount(c)?.id ?? null);
     const account = sessionAccount(c);
     if (!account) {
       if (c.req.path === "/api/health") return c.json({ ...deps.publicHealth(), signedIn: false });

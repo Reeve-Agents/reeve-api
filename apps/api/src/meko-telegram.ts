@@ -73,11 +73,21 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
   /** The chat to push a message to for one tenant pseudonym, or null (not linked, or linked before push was on). */
   const chatFor = (subject: string): string | null => links().push?.[subject]?.chat_id ?? null;
   const keepChat = (subject: string, chat: string | number) => {
-    if (!deps.keepChatIds || subject === OWNER_SUBJECT) return;
     const l = links();
-    if (l.push?.[subject]?.chat_id === String(chat)) return;
-    (l.push ??= {})[subject] = { chat_id: String(chat), at: new Date(now()).toISOString() };
-    deps.store.save();
+    const id = String(chat);
+    let changed = false;
+    // A chat that links again under another pseudonym (or becomes the owner's chat) must not stay the push target of the old one.
+    for (const [other, p] of Object.entries(l.push ?? {})) {
+      if (other !== subject && p.chat_id === id) {
+        delete l.push![other];
+        changed = true;
+      }
+    }
+    if (deps.keepChatIds && subject !== OWNER_SUBJECT && l.push?.[subject]?.chat_id !== id) {
+      (l.push ??= {})[subject] = { chat_id: id, at: new Date(now()).toISOString() };
+      changed = true;
+    }
+    if (changed) deps.store.save();
   };
 
   const ownerLinked = () => Object.values(links().chats).some((c) => c.subject === OWNER_SUBJECT);
