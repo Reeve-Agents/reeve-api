@@ -31,9 +31,12 @@ export function traceBodyOf(entry: DecisionBody, m: MekoMessage): TraceBody {
   };
 }
 
-/** The first anchor after the decision covers it (its leaves include every earlier receipt and decision). */
-export function anchorProof(entries: LedgerEntry[], decision: LedgerEntry): DecisionCheck["checks"]["anchored"] {
-  const anchor = entries.find((e): e is LedgerEntry & AnchorBody => e.kind === "anchor" && e.seq > decision.seq);
+/**
+ * The first anchor after the decision covers it (its leaves include every earlier receipt and decision).
+ * `onchain: true` looks only at anchors published on a chain (they carry a tx or explorer link), not at a local Merkle root.
+ */
+export function anchorProof(entries: LedgerEntry[], decision: LedgerEntry, opts: { onchain?: boolean } = {}): DecisionCheck["checks"]["anchored"] {
+  const anchor = entries.find((e): e is LedgerEntry & AnchorBody => e.kind === "anchor" && e.seq > decision.seq && (!opts.onchain || !!(e.tx || e.explorer)));
   if (!anchor) return null;
   const leaves = anchorLeaves(entries.filter((e) => e.seq < anchor.seq)).slice(0, anchor.leaves);
   const index = leaves.indexOf(decision.entry_hash);

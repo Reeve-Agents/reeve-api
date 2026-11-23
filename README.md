@@ -16,7 +16,8 @@ Reeve's agents now do work, not only watch: they fill a vacant room, run daily c
 **Try it live (no account, no key, no passkey):**
 - Decision traces: https://reeve-web-delta.vercel.app/?view=jejak. Every decision, its reasoning from the Meko trace, and a "Cek" that recomputes the hashes against Meko.
 - Rapor Usaha, the audit report built from traces and receipts, with an ID/EN toggle: https://production-reeve-backend.tyzo.nodeops.app/api/meko/public/report.html.
-- What the live data is: the Kos Melati demo, seeded on Meko Cloud on 23 Nov 2026. It holds 108 decisions, all verified against their receipts, and 107 of them sit inside an anchored Merkle root.
+- What the live data is: the Kos Melati demo, seeded on Meko Cloud on 23 Nov 2026. It holds 108 decisions, all verified against their receipts, and 107 of them sit inside a local Merkle root (the ledger's own hash tree, recorded in the ledger). A Merkle root is published on-chain only when the anchor entry carries a transaction hash; the Rapor says which one each row has.
+- Where it comes from, said plainly: the data comes from one seed run, not from months of use. Messages go to the Log connector (recorded, not sent), the deposit uses a mock rail, and the owner approvals in it are marked `demo` (no passkey).
 
 > **What existed before 7 Nov 2026.** The Builder, the Auditor with planted defects, the Operator (broker), the payment rails, the receipt ledger, the Monad testnet anchor and the web studio were built before ContextCon, for earlier hackathons (this repo was imported on 20 Oct 2026). Everything Meko-related is new and lives on branch `feat/meko-active-crew`, in dated commits from 21 Nov 2026: `packages/meko`, `packages/crew`, `apps/api/src/meko.ts`, `apps/cli/src/crew-demo.ts`, the `decision` ledger entry and the `?view=jejak` page in reeve-web.
 
