@@ -54,6 +54,10 @@ export interface AccountDeps {
   supabase?: { url: string; key: string } | null;
   /** Read-only public apps served without a session, by path prefix (the Meko demo workspace). */
   publicApps?: { prefix: string; fetch: (req: Request) => Response | Promise<Response> }[];
+  /** Tried before the workspaces for an inbound webhook (the Meko demo's Telegram tenants); null passes it on. */
+  webhookFirst?: (req: Request) => Promise<Response | null>;
+  /** Apps outside the workspace that still need a signed-in owner, by path prefix (Meko owner actions). */
+  ownerApps?: { prefix: string; fetch: (req: Request, account: string) => Response | Promise<Response> }[];
 }
 
 const COOKIE = "reeve_session";
@@ -273,6 +277,8 @@ export async function createAccountsApp(deps: AccountDeps) {
     // The bill or chat belongs to one workspace, so offer it to each until one takes it.
     if (c.req.path.startsWith("/api/webhooks/")) {
       const raw = await c.req.text();
+      const first = await deps.webhookFirst?.(new Request(c.req.url, { method: c.req.method, headers: c.req.raw.headers, body: c.req.method === "GET" ? undefined : raw }));
+      if (first) return first;
       let last: Response | null = null;
       for (const a of Object.values(index.accounts)) {
         const res = await (await workspace(a)).fetch(new Request(c.req.url, { method: c.req.method, headers: c.req.raw.headers, body: c.req.method === "GET" ? undefined : raw }));
@@ -289,6 +295,8 @@ export async function createAccountsApp(deps: AccountDeps) {
       if (c.req.path === "/api/health") return c.json({ ...deps.publicHealth(), signedIn: false });
       return c.json({ error: "Masuk dulu untuk memakai Reeve." }, 401);
     }
+    const own = deps.ownerApps?.find((p) => c.req.path.startsWith(p.prefix));
+    if (own) return own.fetch(c.req.raw, account.id);
     return (await workspace(account)).fetch(c.req.raw);
   });
 

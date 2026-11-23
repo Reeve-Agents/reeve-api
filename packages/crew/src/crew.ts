@@ -19,7 +19,11 @@ export type WorkerFn = (system: string, user: string) => Promise<{ text: string;
 
 /** Owner's passkey assertion, already verified by the API (or marked as the offline demo). */
 export interface PasskeyProof {
-  method: "passkey" | "demo";
+  /**
+   * "session": the owner confirmed while signed in on the web app (no new passkey ceremony yet; a
+   * step-up passkey ceremony for autonomy changes is a follow-up).
+   */
+  method: "passkey" | "demo" | "session";
   credential_id: string;
   challenge_hash?: string;
 }

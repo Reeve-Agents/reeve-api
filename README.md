@@ -49,6 +49,19 @@ flowchart LR
 - **Tanya usaha**: a read-only agent that answers "kenapa saya didenda?" from the trace, with a link to the proof.
 - **One payment-plan bound**: "maksimal 2 cicilan, lunas sebelum tanggal 25", audited with planted bad offers; offers inside it cite it, the rest go to the owner.
 - **Rapor Usaha**: the audit report generated from traces and receipts, stored in Meko as an artifact.
+- **SOP Discovery** (`?view=temukan`, signed in):
+  - Input: a WhatsApp chat export and the payments sheet (CSV or Excel). Names become `K01`… first.
+  - Code mines rulebook cards. Each card has a confidence and the chat or payment line it came from. No LLM sees the history.
+  - The Auditor replays every past bill against the cards and shows where they differ from what the owner did.
+  - The owner taps Ya/Tidak on each card. Each tap is a trace plus a receipt.
+  - Confirmed cards go through the normal audit with planted defects. Fewer than 3 confirmed keeps Reeve in "mode belajar": it watches and suggests only.
+- **Telegram tenants**:
+  - A one-time code links a tenant's chat. Only an HMAC of the chat id is kept.
+  - "Kenapa saya didenda?" is answered from the trace with a "lihat bukti" link. The answer is a traced decision too.
+  - WhatsApp stays a `wa.me` link the owner sends by hand.
+- **Rapor share links** (`?view=rapor&share=`):
+  - Metrics only. Revocable; whether a link is live is read from the ledger.
+  - The page recomputes every ledger hash and anchor Merkle root in the browser.
 
 ### Run it
 
@@ -61,6 +74,18 @@ meko start
 ```bash
 npm run crew:demo -- --fresh
 ```
+
+Meko Cloud: `npm run meko:seed` (needs `MEKO_API_KEY`; `--local` rehearses on local Meko; `--ledger=pg` writes the ledger where the deployed API reads it).
+
+Where Meko Cloud differs from local Meko (all handled in `packages/meko`, checked on 23 Nov 2026 with a real seed: 113 traced decisions, 113 verified):
+- **Datapack.** A conversation needs a `datapack_id`, and a new account has none. Reeve searches by name (`datapack_search`, any non-empty `conversation_id` works as bootstrap), then tries `datapack_create`. If Cloud refuses (it did: `INTERNAL_ERROR`), create a datapack in the Meko app and set `MEKO_DATAPACK_ID` (or `MEKO_DATAPACK_ID_<WORKSPACE>`).
+- **Metadata and plan** go over as JSON strings and come back as strings; Reeve converts them so the receipt hash still matches.
+- **Messages** come 100 per call (`limit`/`offset`); Reeve pages.
+- **Reads can lag** (`not_found` just after a write): retried up to 6 times.
+- **Promoted memories** are in the knowledge base, but `context_search` sometimes skips that source; Reeve asks `knowledgebase_search` when it comes back empty, and waits for a new owner exception to be searchable before the Operator acts on it.
+- **Cloud distils facts from traces** ("K05 is 10 days late") into memories. An owner exception now counts only in the owner's wording ("boleh telat"), so a distilled fact can never become a permission.
+- **Conversations are permanent and deduplicated by session id**, so every seed gets a fresh run id. `--fresh` cannot wipe a Cloud datapack.
+- `track_token_usage` works (`recorded: true`); `datapack_metrics` does not exist on Cloud, so the Rapor computes its token saving from Reeve's own ledger and traces (same on local and Cloud, source named in the report). Meko Cloud's `selflearning_*` tools feed a read-only "Pencarian lemah" section in the Rapor (`GET /api/meko/owner/weak`).
 
 ```bash
 npm run dev
@@ -80,6 +105,85 @@ Then open the web app at `/?view=jejak` (no sign-in needed) and the report at `/
 | `context_search` | 26 searches before acting |
 
 Limits, said plainly: content metrics are simulated; connectors run on the Log connector (recorded, not sent) until Instagram, WhatsApp and Calendar are connected; the seed marks the owner's passkey as `demo` (the API's real passkey flow is unchanged); `track_token_usage` needs Meko Cloud; SOP documents are not yet uploaded to the Meko knowledge base.
+
+### Gotong Royong: shared learning across businesses (`npm run gotong:demo`)
+
+Businesses that consent pool what their first drafts taught the Builder, as anonymous aggregate patterns in one project-level datapack (`reeve-gotong-royong`). A new business's Builder reads the pool before it drafts.
+
+- **Consent.** `consentShare` is an owner decision (`consent_share_patterns`) with a receipt, per kind of pattern, revocable. A business that has not consented contributes nothing (`withheld`).
+- **Patterns.** `extractPatterns` derives them from real pipeline runs (Builder, Auditor, sandbox) of each business's first drafts: planted-defect kinds planted and surviving, and why first drafts were rejected. An aggregate behind fewer than 2 businesses is dropped. Dropped on purpose, and reported: content hooks (only Kos Melati runs content and its reach numbers are simulated, so k = 1) and reminder times (the crew records the day of a reminder, not its time).
+- **Publish.** `publish` writes each pattern as promoted memory with a receipt that holds counts, kinds and consent-receipt hashes only. A leak check refuses any business name, alias, amount, phone or id. All of this is plain code; no model decides whether to share.
+- **Read.** `readForNewBusiness` runs `context_search` on the pool and returns short hint sentences (composed by code from the counts). `parseSop(..., { sharedHints })` adds them to the Builder's prompt as an advisory block; with no hints the prompt is byte-for-byte unchanged. The Builder's compile step stays deterministic, so the only place hints can matter is the model's rule cards (the first draft).
+
+Measured on a new business, "laundry kiloan" (a SOP of 6 rules incl. an owner-approval limit, 12 records; `apps/cli/fixtures/laundry-kiloan`). Claude Haiku 5.5, local Meko, 12 runs per arm, interleaved, first attempt only (no repair loop), 22 Nov 2026:
+
+| | without hints | with hints |
+|---|---|---|
+| First draft passed the Auditor | 4 of 12 | 12 of 12 |
+| Blockers per draft (mean / median / min / max) | 0.67 / 1 / 0 / 1 | 0 / 0 / 0 / 0 |
+| Planted-defect survivors on the first attempt (mean / median / min / max) | 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 |
+| Input tokens per run (mean / median / min / max) | 3,934 / 3,934 / 3,934 / 3,934 | 4,136 / 4,136 / 4,136 / 4,136 |
+| Output tokens per run (mean / median / min / max) | 4,869 / 4,865 / 4,299 / 5,420 | 4,856 / 4,769 / 4,346 / 5,603 |
+| Cost per run | $0.0028 | $0.0028 |
+
+What it shows. The 8 failures without hints are the same blocker: an approval-limit card with no rule naming the amount field (`RULEBOOK_INVALID`, rejected before anything runs). The pool held exactly that pattern (1 of 9 first drafts across 3 businesses), the hint states it, and with it 12 of 12 drafts passed. The hint costs 202 input tokens and no extra output. On planted-defect survivors the result is null: no first draft in either arm, and none of the 9 first drafts in the pool, left a planted defect alive, because the Auditor derives its spec from the cards. So "defect kinds that usually survive" has no data to teach and the claim is not made.
+
+What it does not prove. One new business, one SOP, one model, N = 12 per arm, 24 calls (plus a 2-call pilot, 26 of the 30-call cap, about US$0.07). The failure the hint prevents was seen in one of the pool's own drafts (a Haiku draft of the Bimbel SOP) and the laundry SOP has the same kind of approval rule, so this is the best case for a hint, not a typical one. The pool is built from saved first drafts of three businesses and three models, not from a long-running fleet. The hint text is a template filled by code, not learned wording. The fixture mode (`npm run gotong:demo`, the default) returns the same rulebook in both arms: it is deterministic, proves the wiring (hints reach the prompt, 589 more characters) and the consent, k >= 2 and leak checks, and shows no effect by design. In the demo all workspaces share one ledger file; in production each business keeps its own, and only the pool's workspace is shared.
+
+`npm run gotong:demo -- --fake` runs on in-memory Meko; `--runs=N` sets runs per arm; `--llm` uses Haiku (needs `ANTHROPIC_API_KEY`; refuses more than 30 LLM calls and stops if one run costs over US$0.05). Results go to `.reeve/gotong/results-*.json`.
+
+### Token efficiency: code decides vs LLM in the loop (`npm run bench:tokens`)
+
+The same Kos Melati months run two ways. Both arms get the same 49 decision events (the 36 bills of `kosDiscoverySample()`, each checked on H+3, H+7, H+10 and H+14 while still unpaid, or on the day paid when that is before H+3). Ground truth is what the approved rule cards decide (`decideRent`, the logic of `rentTick`, incl. the 12-month grace, once-per-bill fee and the planted exception: K03 in September has the owner's permission to be late, so its fee is held). Mix: 28 none, 13 remind, 5 charge_fee Rp75.000, 2 hold, 1 notice.
+
+- **LLM in the loop.** Per event one call: the full SOP, the whole pseudonymised chat and payments history up to that day, and the bill; strict JSON back (`remind | charge_fee + amount | hold | escalate | none`) plus the message to send.
+- **Reeve.** The SOP is compiled once by the Builder (Haiku). Each decision is made by `rentTick` (code, with a Meko `context_search` for the owner's exceptions). The model only words the message for remind, fee and notice, from the facts plus the 3 best Meko chunks (the `Worker` prompt of `packages/crew`).
+
+Claude Haiku 5.5, local Meko, 10 runs per arm, interleaved, 22 Nov 2026. Per run, mean / median / min / max:
+
+| arm | LLM calls | input tok | output tok | cost (USD) | accuracy vs rules |
+|---|---|---|---|---|---|
+| LLM in the loop | 49 | 105,407 (constant) | 13,345 / 13,290 / 12,367 / 14,316 | 0.0172 / 0.0172 / 0.0167 / 0.0177 | 93.1% / 92.9% / 89.8% / 95.9% |
+| Reeve | 19 | 5,677 (constant) | 9,298 / 9,174 / 8,717 / 10,080 | 0.0052 / 0.0052 / 0.0049 / 0.0056 | 100% (all 10 runs) |
+| ratio (means) | 2.6x | 18.6x | 1.4x | 3.3x | |
+
+Calls, input tokens and (for Reeve) accuracy do not vary between runs, so their four statistics are the same number. Wall time per run: 93 to 102 s baseline, 54 to 62 s Reeve (sequential calls, local Meko).
+
+Where the baseline is wrong: fee decisions 72% (36 of 50 across runs), the planted exception 75% (15 of 20), plain "none" 94.6% (265 of 280), reminders and notices 100%; 15 of its 490 replies were not valid JSON with a known action and count as wrong. Reeve had no wrong decision, but that is partly by construction: its decisions run the same logic as the ground truth. What it does test is that Meko finds the owner's exception (20 of 20 holds).
+
+Compile, paid once: 2,844 input + 3,211 output tokens, US$0.0019 (mean of 3 Builder calls, none failed; in an aborted earlier run one draft failed conversion, a card missing a field, which the script now retries and counts). Extrapolated from the measured month, not measured: with the compile paid once, Reeve costs US$0.0071 for 1 month (2.4x cheaper), US$0.0175 for 3 months (2.9x) and US$0.0645 for 12 months (3.2x) against US$0.0172, US$0.0516 and US$0.2066 for the baseline; input tokens 8.5k / 19.9k / 71.0k against 105k / 316k / 1,265k.
+
+What it does not prove. One business, one SOP, one model, 10 runs, 49 events. The saving is large on input tokens (18.6x) and small on cost (3.3x): Haiku 5.5 spends most of its billed output on reasoning before it answers, and the Reeve Worker's wording call is billed the same way, so output tokens fall only 1.4x and output dominates the Reeve bill. The baseline's accuracy (93%) is good; the gap is on fees and the exception, not on routine reminders. The baseline got every advantage we could give it: no prompt caching on either side (a cached SOP and history prefix would cut the baseline input cost), history cut to what was known before each day, the same message wording task, the same model, parameters (SDK default temperature, max 1,200 output tokens) and sequential calls. A smarter baseline (retrieval instead of the whole history) would sit between the two arms; it was not run. Not counted: Meko's own cost (local here), the one-time Auditor/sandbox run, the owner's approval, and the Validator. Reeve's compiled rulebook is not what executes in this benchmark: decisions run the approved fixture cards in `rentTick`, so whether a Haiku compile reproduces them is a separate question (the Auditor's job). Cost uses the price table in `packages/llm` (Haiku 5.5, US$0.10 in and US$0.50 out per million tokens, standard tier). Total spend for the real run: about US$0.23 of a US$2.50 cap.
+
+Rerun: `npm run bench:tokens -- --fake` is an offline deterministic stub with a fake counter (4 characters per token; labelled "FAKE", not a measurement). Real: start local Meko (`meko start`), then `npm run bench:tokens -- --llm --runs=10` (needs `ANTHROPIC_API_KEY` in `.env`; `--fake-meko` for in-memory Meko; `--compiles=N`). It stops if the first baseline run costs over US$0.30 or the estimate passes US$2.50. Results: `.reeve/bench/tokens-*.json` (gitignored). The scoring and aggregation are covered by `apps/cli/test/token-bench.test.ts`.
+
+### Beli bareng (group buying, `npm run groupbuy:demo`)
+
+Three minimarkets (pseudonymised M1 to M3) buy from one supplier (S1). Code batches their purchase orders per sku, prices every line at the supplier's volume tier and works out each owner's total and saving against buying alone. No model decides anything. Each owner consents first (`consent_group_buy`) and approves only their own line (`approve_group_line`, in their own workspace; the decision holds none of the others' quantities). A refusal drops that line and the batch is recomputed, so a tier can drop. After at least 2 approvals the batched order is placed as `place_group_order` in the shared workspace (receipt hashes and per-sku totals, no business names) through the Log connector. `verifyGroupOrder()` re-reads every receipt and checks the approved lines add up to the order; an edited line fails it.
+
+Run it: start local Meko (`meko start`, see above), then `npm run groupbuy:demo` (`-- --fake` for in-memory Meko). It prints three scenarios (all agree, one refuses, one has not consented) with qty, line total, saving and receipt prefix per business.
+
+Limits: the POs are a small fixture, not real orders; the supplier tiers (5% from 50 units, 8% from 100 per sku) are assumptions, not a real price list; nothing is sent to a supplier and no money moves.
+
+### Pembelajaran mandiri (self-learning)
+
+The loop: the owner keeps granting the same exception ("kamar 3 boleh telat sampai 15 hari", three times) -> Reeve notices the pattern -> the Builder proposes an SOP amendment as a plain Indonesian diff -> the Auditor runs the full audit on the amended rulebook (spec cases and planted defects) -> only if every planted defect is caught is it offered -> the owner approves or rejects -> the improvement is shown from a replay of the history. Nothing changes until the owner approves, and approving saves a rulebook version and sends nothing.
+
+What runs locally (all of it, no Meko Cloud needed): `packages/crew/src/amend.ts`. `recordException` stores each exception as promoted Meko memory (tagged with rule id and a reason class, e.g. `late_grace:15`, days rounded up to 5) plus an `owner_exception` decision with a receipt. `localShortfalls` clusters by rule and class and counts distinct (tenant, month) pairs; 3 or more is a shortfall (`SHORTFALL_MIN`). `proposeAmendment` changes the rulebook in code (late fee start day only, today), traces `amend_propose` (Builder) and `amend_audit` (Auditor), and the owner's `amend_approve` / `amend_reject` carry a session-confirmation proof, like the autonomy ladder. `verifyImprovement` replays the history under the old and the amended rule and counts the bills that needed an owner exception (demo: 3 of 24 become 0, no other bill changes), and counts `context_search` hits on the exception text before, and again after approval (new exceptions since). If there is no history it says so instead of claiming anything; if the replay does not improve, the page says "belum terbukti".
+
+Cloud only, unverified: Meko Cloud may offer `selflearning_shortfalls` and `selflearning_verify`. Local Meko 1.20261116 has no such tools (40 tools, none match, no flag). `MekoSelfLearning` feature-detects them; with `REEVE_SELFLEARNING=cloud` and the tool present it calls `selflearning_shortfalls` with best-effort arguments (their schema is not known) and uses the answer only when it names a rule that has a local cluster; on a missing tool, an error or an unknown shape it falls back to the local code and records which path ran in the amendment (`path`, `path_note`). `selflearning_verify` is called as an extra and its answer is never used to claim an improvement. The Cloud path has never been run against real Cloud.
+
+Flags. `REEVE_SOP_AMENDMENTS=on` (off by default) enables `GET /api/meko/owner/amendments`, `POST .../amendments/scan`, `.../amendments/:id/approve` and `.../reject`; with it off the list is empty (`enabled:false`) and the other routes answer 409. `REEVE_SELFLEARNING=cloud` asks Cloud first. `npm run crew:demo -- --amend` seeds four exceptions (three of the 15-day kind, one 10-day kind that stays below the threshold) and one pending amendment (run the API with the flag on).
+
+Limits: one kind of change (a later late-fee day) is automated; other exception reasons are counted but not turned into a rule change. The improvement is measured on the demo's synthetic three-month history, which was written so the owner follows the SOP except for those exceptions; on real history the replay may well show other differences, and the page shows them. The audit proves the amended rules are internally consistent, not that the new tolerance is a good business decision. In the amended demo rulebook the notice (H+14) comes before the fee (H+15); the diff says so.
+
+### Ketenangan pemilik (calm for the owner)
+
+Two things so the owner is not pinged all day. Digest: one message per day, built by code from ledger facts (no LLM): what ran by itself per class, what is staged and can still be undone, how many drafts wait, amendment proposals pending, ledger intact yes/no, a link to `/?view=kendali`. Counts and pseudonymous facts only, never a tenant name. `sendDigest` records one `send_digest` decision per day (output `{date, hash, channel, delivered}`); a second call the same day returns the first receipt and sends nothing. Undo window, done truthfully: an auto-run action is not executed at once. `Outbox.stage` writes it to `meko_outbox` with `due_at = now + 10 min` (decision `auto_stage`); `flush` runs it once through the injected connector after that (decision `auto_run`, the clean evidence for the ladder); `undo` before `due_at` cancels it so it never runs, records an `undo` receipt that links the staged one, and drops the class one level. After the window undo is refused ("Sudah terkirim, tidak bisa dibatalkan"). In the demo the connector is the Log connector, so nothing is really sent; `crew:demo` leaves two reminders past the window and two inside it.
+
+Routes (session-guarded): `GET /api/meko/owner/outbox`, `POST .../outbox/:id/undo`, `GET .../digest` (text, a `wa.me` link the owner opens and sends themselves, channel status), `POST .../digest/send`. The page is Kendali ("Ringkasan hari ini", "Jalan sendiri, bisa dibatalkan"). The owner can bind their own Telegram chat (`POST .../telegram/owner-link`, code subject `PEMILIK`; tenant links stay `K05`-style) and send `/ringkasan`: the digest comes back as the webhook reply, so no bot token is needed.
+
+What is dry-run: `/digest/send` returns the text and sends nothing. A real Telegram push needs all of `TELEGRAM_BOT_TOKEN`, `REEVE_DIGEST=on` and `TELEGRAM_OWNER_CHAT_ID`; any one missing means dry run. That live path is unit-tested with an injected fetch only and has never been run against Telegram. The API flushes the outbox when the owner page or the digest is read, not on a timer, so a due item runs on the next read.
 
 ## Quick start
 

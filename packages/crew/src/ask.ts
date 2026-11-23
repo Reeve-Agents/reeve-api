@@ -14,6 +14,8 @@ export interface Asker {
   role: "tenant" | "staff" | "owner";
   /** The tenant's pseudonymous id, for "kenapa saya didenda?". */
   subject?: string;
+  /** Where the question came from ("telegram", "web"); recorded in the trace. */
+  channel?: string;
 }
 
 const rp = (n: number) => `Rp${n.toLocaleString("id-ID")}`;
@@ -83,7 +85,7 @@ export class AskBusiness {
     }
     if (proofs.length) text += `\nLihat bukti: ${proofs.map((p) => p.url).join(" ")}`;
     const d = await t.decide({
-      input: `${who.role}${who.subject ? ` ${who.subject}` : ""}: ${question}`,
+      input: `${who.role}${who.subject ? ` ${who.subject}` : ""}${who.channel ? ` via ${who.channel}` : ""}: ${question}`,
       output: { kind, answer: text, proofs: proofs.map((p) => p.receipt) },
       reasoning: `Read-only answer of kind ${kind}, built from ${proofs.length} recorded decision(s); this agent has no tools that act.`,
       action: "explain",

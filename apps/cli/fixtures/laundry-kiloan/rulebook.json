@@ -1,0 +1,127 @@
+{
+  "pack": "generic",
+  "business_name": "Laundry Kiloan Bersih Wangi",
+  "currency": "IDR",
+  "data": {
+    "entity": "Pelanggan",
+    "entity_plural": "Pelanggan",
+    "key_field": "id",
+    "fields": [
+      { "name": "id", "type": "text" },
+      { "name": "name", "type": "text" },
+      { "name": "email", "type": "text" },
+      { "name": "telegram_chat_id", "type": "number" },
+      { "name": "bill", "type": "number" },
+      { "name": "done_date", "type": "date" },
+      { "name": "laundry_status", "type": "text" },
+      { "name": "pay_status", "type": "text" },
+      { "name": "kilo_left", "type": "number" },
+      { "name": "blocked", "type": "text" }
+    ],
+    "source": { "connector": "googlesheets", "tool": "GOOGLESHEETS_BATCH_GET" }
+  },
+  "cards": [
+    {
+      "id": "R1",
+      "kind": "rule",
+      "type": "generic_rule",
+      "title": "Telegram ke pelanggan saat cucian selesai dan belum dibayar",
+      "source_quote": "Setiap hari, kalau cucian sudah selesai dan belum dibayar, kirim Telegram ke pelanggan bahwa cucian siap diambil.",
+      "schedule": { "every": "day", "weekday": null, "day_of_month": null },
+      "match": "all",
+      "conditions": [
+        { "field": "laundry_status", "op": "eq", "value": "selesai" },
+        { "field": "pay_status", "op": "neq", "value": "lunas" }
+      ],
+      "action": {
+        "connector": "telegram",
+        "tool": "TELEGRAM_SEND_MESSAGE",
+        "args": [
+          { "name": "chat_id", "template": "{telegram_chat_id}" },
+          { "name": "text", "template": "Halo {name}, cucian Anda sudah selesai. Tagihan Rp{bill}. - Bersih Wangi" }
+        ],
+        "amount_field": "bill"
+      },
+      "once_per_record": false
+    },
+    {
+      "id": "R2",
+      "kind": "rule",
+      "type": "generic_rule",
+      "title": "Email pengingat sekali saat cucian selesai lebih dari 3 hari",
+      "source_quote": "Kalau cucian sudah selesai lebih dari 3 hari dan belum diambil, kirim email pengingat ke pelanggan, cukup sekali.",
+      "schedule": { "every": "day", "weekday": null, "day_of_month": null },
+      "match": "all",
+      "conditions": [
+        { "field": "laundry_status", "op": "eq", "value": "selesai" },
+        { "field": "done_date", "op": "days_since_gte", "value": 4 }
+      ],
+      "action": {
+        "connector": "gmail",
+        "tool": "GMAIL_SEND_EMAIL",
+        "args": [
+          { "name": "recipient_email", "template": "{email}" },
+          { "name": "subject", "template": "Cucian {name} belum diambil" },
+          { "name": "body", "template": "Cucian Anda selesai {done_date} dan belum diambil. Tagihan Rp{bill}." }
+        ],
+        "amount_field": "bill"
+      },
+      "once_per_record": true
+    },
+    {
+      "id": "R3",
+      "kind": "rule",
+      "type": "generic_rule",
+      "title": "Tawaran isi ulang paket saat sisa kilo kurang dari 3",
+      "source_quote": "Kalau pelanggan membeli paket kiloan dan sisa kilonya kurang dari 3 kg, kirim Telegram tawaran isi ulang paket, cukup sekali.",
+      "schedule": { "every": "day", "weekday": null, "day_of_month": null },
+      "match": "all",
+      "conditions": [{ "field": "kilo_left", "op": "lt", "value": 3 }],
+      "action": {
+        "connector": "telegram",
+        "tool": "TELEGRAM_SEND_MESSAGE",
+        "args": [
+          { "name": "chat_id", "template": "{telegram_chat_id}" },
+          { "name": "text", "template": "Halo {name}, sisa paket Anda {kilo_left} kg. Mau isi ulang?" }
+        ],
+        "amount_field": null
+      },
+      "once_per_record": true
+    },
+    {
+      "id": "R4",
+      "kind": "constraint",
+      "type": "generic_never",
+      "title": "Tidak pernah mengirim pesan ke pelanggan yang diblokir",
+      "source_quote": "Jangan pernah kirim pesan apa pun ke pelanggan yang diblokir.",
+      "tool": "*",
+      "match": "all",
+      "conditions": [{ "field": "blocked", "op": "eq", "value": "ya" }]
+    },
+    {
+      "id": "R5",
+      "kind": "constraint",
+      "type": "generic_approval",
+      "title": "Tagihan di atas Rp300.000 menunggu persetujuan pemilik",
+      "source_quote": "Untuk tagihan di atas Rp300.000, saya harus setuju dulu sebelum pesannya dikirim.",
+      "tool": "*",
+      "amount_above": 300000
+    },
+    {
+      "id": "R6",
+      "kind": "kpi",
+      "type": "generic_kpi",
+      "title": "Setiap Senin: total tagihan belum dibayar di atas Rp1.500.000, kabari pemilik",
+      "source_quote": "Setiap Senin, kalau total tagihan yang belum dibayar lebih dari Rp1.500.000, kabari saya.",
+      "schedule": { "every": "week", "weekday": 0, "day_of_month": null },
+      "aggregate": "sum",
+      "field": "bill",
+      "match": "all",
+      "conditions": [{ "field": "pay_status", "op": "neq", "value": "lunas" }],
+      "alert_if": "above",
+      "threshold": 1500000
+    }
+  ],
+  "questions": ["Cucian selesai dan belum dibayar dikabari setiap hari. Cukup sekali saja?"],
+  "assumptions": ["\"Belum dibayar\" berarti kolom pay_status bukan \"lunas\".", "Nama tool Telegram dan Gmail mengikuti Composio."]
+}

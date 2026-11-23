@@ -1,15 +1,17 @@
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
-import { anchorFromEnv } from "@reeve/anchor";
+import { anchorFromEnv, encodeAnchor } from "@reeve/anchor";
 import type { PackId } from "@reeve/core";
 import { ProviderRegistry } from "@reeve/llm";
-import { bimbelRecords, kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, minimarketScenario, PACK_FIXTURE, repoRoot } from "@reeve/pipeline";
+import { bimbelRecords, kosMelatiScenario, loadFixtureRulebook, loadFixtureSop, minimarketScenario, PACK_FIXTURE, repoRoot, runAttempt } from "@reeve/pipeline";
 import { connectorsFromEnv, inferFields } from "@reeve/connectors";
 import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
-import { createMekoApp } from "./meko";
+import { createMekoApp, createMekoOwnerApp, mekoOpener } from "./meko";
+import { digestSenderFromEnv } from "@reeve/crew";
+import { mekoTelegram } from "./meko-telegram";
 import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
 import { schedulerFromEnv } from "./scheduler";
 import { filePersistence } from "./persistence";
@@ -51,17 +53,42 @@ const scheduler = schedulerFromEnv();
 // Local Meko by default; Meko Cloud with MEKO_API_KEY. Seed it with `npm run crew:demo`.
 const mekoWorkspace = process.env.REEVE_MEKO_WORKSPACE ?? "kos-melati";
 const mekoEndpoint = mekoEndpointFromEnv();
-const mekoApp = createMekoApp({
+const mekoStore = await persistence.openWorkspace(`meko-${mekoWorkspace}`);
+const mekoDeps = {
   workspace: mekoWorkspace,
-  ledger: (await persistence.openWorkspace(`meko-${mekoWorkspace}`)).ledger,
+  ledger: mekoStore.ledger,
   connect: () => connectMeko(mekoEndpoint),
   endpoint: mekoEndpoint,
   allowAsk: process.env.REEVE_MEKO_PUBLIC_ASK === "on",
-});
+  encodeAnchor: (root: string, leaves: number) => encodeAnchor(root, leaves),
+};
+const mekoOpen = mekoOpener(mekoDeps);
+const mekoApp = createMekoApp(mekoDeps, mekoOpen);
+// Tenants ask "kenapa saya didenda?" on Telegram (same bot webhook and secret as the workspaces).
+const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, digest: () => mekoOwner.digestText() });
+// Owner actions on that workspace (SOP Discovery), behind the session at /api/meko/owner/*.
+const mekoOwner = createMekoOwnerApp(
+  {
+    audit: async (rulebook) => {
+      const a = await runAttempt({ repoRoot, rulebook, scenario: kosMelatiScenario(), sandbox, runId: `discovery-${Date.now().toString(36)}` });
+      const mut = a.results?.mutation;
+      return { status: a.verdict.status, cases: a.plan.cases.length, killed: mut?.killed ?? 0, total: mut?.total ?? 0 };
+    },
+    template: () => loadFixtureRulebook(),
+    telegram: mekoTg,
+    // Daily digest: dry run unless TELEGRAM_BOT_TOKEN, REEVE_DIGEST=on and TELEGRAM_OWNER_CHAT_ID are all set.
+    digest: { sender: digestSenderFromEnv() },
+    webOrigin: origin,
+    store: mekoStore.store,
+  },
+  mekoOpen,
+);
 
 const { app, openAll } = await createAccountsApp({
   persistence,
   publicApps: [{ prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) }],
+  webhookFirst: (req) => (new URL(req.url).pathname === "/api/webhooks/telegram" ? mekoTg.handle(req) : Promise.resolve(null)),
+  ownerApps: [{ prefix: "/api/meko/owner/", fetch: (req, account) => mekoOwner.fetch(req, account) }],
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
   supabase,
