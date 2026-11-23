@@ -9,8 +9,9 @@ import { railEntries } from "@reeve/rails";
 import { sandboxFromEnv, type Sandbox } from "@reeve/sandbox";
 import { createAccountsApp } from "./accounts";
 import { createApp } from "./app";
-import { createMekoApp, createMekoOwnerApp, mekoOpener } from "./meko";
-import { digestSenderFromEnv } from "@reeve/crew";
+import { createMekoApp, createMekoOwnerApp, createMekoTickApp, mekoOpener } from "./meko";
+import { digestSenderFromEnv, liveExecutor } from "@reeve/crew";
+import { startMekoTicker } from "./meko-ticker";
 import { mekoTelegram } from "./meko-telegram";
 import { connectMeko, mekoEndpointFromEnv } from "@reeve/meko";
 import { schedulerFromEnv } from "./scheduler";
@@ -65,7 +66,9 @@ const mekoDeps = {
 const mekoOpen = mekoOpener(mekoDeps);
 const mekoApp = createMekoApp(mekoDeps, mekoOpen);
 // Tenants ask "kenapa saya didenda?" on Telegram (same bot webhook and secret as the workspaces).
-const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, digest: () => mekoOwner.digestText() });
+// With TELEGRAM_BOT_TOKEN the bot can also write first, so a tenant's chat id is kept for the live billing tick.
+const botToken = process.env.TELEGRAM_BOT_TOKEN || undefined;
+const mekoTg = mekoTelegram({ secret: process.env.TELEGRAM_WEBHOOK_SECRET || undefined, store: mekoStore.store, open: mekoOpen, webOrigin: origin, botUsername: process.env.TELEGRAM_BOT_USERNAME || undefined, keepChatIds: !!botToken, digest: () => mekoOwner.digestText() });
 // Owner actions on that workspace (SOP Discovery), behind the session at /api/meko/owner/*.
 const mekoOwner = createMekoOwnerApp(
   {
@@ -78,17 +81,22 @@ const mekoOwner = createMekoOwnerApp(
     telegram: mekoTg,
     // Daily digest: dry run unless TELEGRAM_BOT_TOKEN, REEVE_DIGEST=on and TELEGRAM_OWNER_CHAT_ID are all set.
     digest: { sender: digestSenderFromEnv() },
+    // Staged reminders (10-minute undo) go out on Telegram when the token is set and the tenant linked a chat; otherwise the Log connector records them.
+    outbox: { execute: liveExecutor({ token: botToken, chatOf: (subject) => mekoTg.chatFor(subject) }) },
     webOrigin: origin,
     store: mekoStore.store,
   },
   mekoOpen,
 );
+// POST /api/meko/tick: the live billing loop. A signed-in owner, or x-reeve-tick-secret = REEVE_TICK_SECRET.
+const mekoTick = createMekoTickApp({ tick: mekoOwner.tick, secret: process.env.REEVE_TICK_SECRET || undefined });
 
 const { app, openAll } = await createAccountsApp({
   persistence,
   publicApps: [{ prefix: "/api/meko/public/", fetch: (req) => mekoApp.fetch(req) }],
   webhookFirst: (req) => (new URL(req.url).pathname === "/api/webhooks/telegram" ? mekoTg.handle(req) : Promise.resolve(null)),
   ownerApps: [{ prefix: "/api/meko/owner/", fetch: (req, account) => mekoOwner.fetch(req, account) }],
+  optionalSessionApps: [{ prefix: "/api/meko/tick", fetch: (req, account) => mekoTick.fetch(req, account) }],
   rp,
   sessionSecret: process.env.REEVE_SESSION_SECRET,
   supabase,
@@ -135,6 +143,12 @@ const server = serve({ fetch: app.fetch, port }, () => {
 if (scheduler.enabled) {
   await openAll();
   console.log(`scheduler on: one business day every ${scheduler.daySeconds}s, checked every ${scheduler.tickMs}ms`);
+}
+
+// REEVE_MEKO_TICK=on: run the billing tick once after start-up, then every day at about 08:00 WIB.
+if (process.env.REEVE_MEKO_TICK === "on") {
+  startMekoTicker({ tick: () => mekoOwner.tick().then((r) => console.log(`meko tick ${r.date}: ${r.repeated ? "already done today" : r.note}`)), flush: () => mekoOwner.flush() });
+  console.log(`meko tick on: after start-up and daily at about 08:00 WIB; reminders go via ${botToken ? "Telegram (tenants who linked a chat), else the Log connector" : "the Log connector (set TELEGRAM_BOT_TOKEN to send)"}`);
 }
 
 // On a redeploy, finish the queued Postgres writes before exiting.

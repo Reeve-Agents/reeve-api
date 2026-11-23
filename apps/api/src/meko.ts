@@ -2,9 +2,10 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, buildDigest, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { amendmentsEnabled, buildDigest, liveTick, NoBills, type TickReport, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 
 export interface MekoAppDeps {
@@ -121,7 +122,7 @@ export interface MekoOwnerDeps {
   /** SOP amendments (self-learning loop). Default: the REEVE_SOP_AMENDMENTS flag, off unless set. */
   amend?: { enabled?: () => boolean; env?: Record<string, string | undefined>; history?: () => History | null };
   telegram?: { createLink(subject: string): unknown; createOwnerLink?(): unknown; ownerLinked?(): boolean; explainForWhatsApp(subject: string, question: string): Promise<unknown> };
-  /** What runs a staged action once its 10-minute window has passed. Default: the Log connector (nothing is sent). */
+  /** What runs a staged action once its 10-minute window has passed. Default: the Log connector (nothing is sent). The live tick's reminders go through it too (Telegram when configured, see liveExecutor). */
   outbox?: { execute?: (tool: string, args: Record<string, unknown>) => Promise<ExecResult> };
   /** Where the daily digest goes. Default: dry run (text only). Live Telegram needs TELEGRAM_BOT_TOKEN + REEVE_DIGEST=on. */
   digest?: { sender?: DigestSender };
@@ -427,5 +428,46 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
       }
     });
 
-  return { app, fetch: (req: Request, account: string) => app.fetch(req, { account }), /** Digest text for today, for the owner's /ringkasan on Telegram. */ digestText: async () => (await digestFor()).text };
+  // The live billing loop: today's tick over the stored bills (liveTick). One at a time; a second caller shares the run.
+  let ticking: Promise<TickReport> | null = null;
+  const tick = (): Promise<TickReport> => {
+    ticking ??= (async () => liveTick({ ws: await open(), store: needStore(), ladder: await getLadder(), outbox: await getOutbox(), execute: logExec, now: clock }))().finally(() => (ticking = null));
+    return ticking;
+  };
+
+  return {
+    app,
+    fetch: (req: Request, account: string) => app.fetch(req, { account }),
+    /** Digest text for today, for the owner's /ringkasan on Telegram. */
+    digestText: async () => (await digestFor()).text,
+    /** One billing tick for today in Asia/Jakarta; idempotent per day (POST /api/meko/tick, the scheduler). */
+    tick,
+    /** Runs staged reminders whose 10-minute window has passed (the scheduler calls this every minute). */
+    flush: async () => {
+      await settled();
+    },
+  };
+}
+
+const sha = (v: string) => createHash("sha256").update(v).digest();
+
+/**
+ * POST /api/meko/tick: the live billing loop. Either the signed-in owner (the account layer passes the
+ * session's account) or the header `x-reeve-tick-secret` equal to REEVE_TICK_SECRET (constant-time
+ * compare). Without the env only the owner session works. Called as `fetch(req, account | null)`.
+ */
+export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; secret?: string }) {
+  const app = new Hono<{ Bindings: { account: string | null } }>().basePath("/api/meko");
+  app.post("/tick", async (c) => {
+    const sent = c.req.header("x-reeve-tick-secret");
+    const bySecret = !!deps.secret && !!sent && timingSafeEqual(sha(sent), sha(deps.secret));
+    if (!bySecret && !c.env?.account) return c.json({ error: "Masuk sebagai pemilik, atau kirim header x-reeve-tick-secret." }, 401);
+    try {
+      return c.json(await deps.tick());
+    } catch (e) {
+      if (e instanceof NoBills) return c.json({ error: e.message }, 409);
+      return c.json({ error: `Tick gagal: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}` }, 503);
+    }
+  });
+  return { app, fetch: (req: Request, account: string | null) => app.fetch(req, { account }) };
 }

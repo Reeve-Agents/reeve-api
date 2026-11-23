@@ -3,6 +3,8 @@
 // the read-only ask agent, which answers from the Meko trace and the ledger with a "lihat bukti"
 // link. The answer is a traced decision. The reply rides in the webhook response (Telegram's
 // "reply with a method" feature), so no bot token is needed and nothing is sent to anyone else.
+// Only when the deployment sets TELEGRAM_BOT_TOKEN (so the live billing tick can message tenants) is
+// the chat id itself also kept, per pseudonym, in `meko_links.push`; without it only an HMAC is.
 // WhatsApp stays a wa.me link the owner opens and sends themselves.
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AskBusiness } from "@reeve/crew";
@@ -13,6 +15,8 @@ export interface MekoLinks {
   /** HMAC of the chat id -> who it is (the chat id itself is never stored). */
   chats: Record<string, { subject: string; at: string }>;
   codes: Record<string, { subject: string; expires: number }>;
+  /** Pseudonym -> the raw chat id, kept only when push messages are on (TELEGRAM_BOT_TOKEN), so the bot can write first. */
+  push?: Record<string, { chat_id: string; at: string }>;
 }
 
 export interface MekoTelegramDeps {
@@ -23,6 +27,8 @@ export interface MekoTelegramDeps {
   /** Absolute web origin for "lihat bukti" links. */
   webOrigin: string;
   botUsername?: string;
+  /** Keep each linked tenant's chat id so reminders can be pushed (set when TELEGRAM_BOT_TOKEN is). Default: only the HMAC is kept. */
+  keepChatIds?: boolean;
   /** The owner's daily digest text (built by code from the ledger); sent as the reply to /ringkasan. */
   digest?: () => Promise<string> | string;
   now?: () => number;
@@ -64,6 +70,16 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
     return { code, url: deps.botUsername ? `https://t.me/${deps.botUsername}?start=${code}` : null, expires: new Date(now() + CODE_TTL).toISOString() };
   }
 
+  /** The chat to push a message to for one tenant pseudonym, or null (not linked, or linked before push was on). */
+  const chatFor = (subject: string): string | null => links().push?.[subject]?.chat_id ?? null;
+  const keepChat = (subject: string, chat: string | number) => {
+    if (!deps.keepChatIds || subject === OWNER_SUBJECT) return;
+    const l = links();
+    if (l.push?.[subject]?.chat_id === String(chat)) return;
+    (l.push ??= {})[subject] = { chat_id: String(chat), at: new Date(now()).toISOString() };
+    deps.store.save();
+  };
+
   const ownerLinked = () => Object.values(links().chats).some((c) => c.subject === OWNER_SUBJECT);
 
   /** Owner: the same explanation as a wa.me link the owner sends themselves (no number, no API). */
@@ -95,11 +111,13 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
       delete l.codes[start[1]!];
       l.chats[chatKey(chat)] = { subject: c.subject, at: new Date(now()).toISOString() };
       deps.store.save();
+      keepChat(c.subject, chat);
       if (c.subject === OWNER_SUBJECT) return reply("Terhubung sebagai pemilik. Kirim /ringkasan kapan saja untuk ringkasan hari ini. Reeve tidak mengirim pesan sendiri kecuali Anda mengaktifkannya.");
       return reply(`Terhubung. Anda bisa bertanya, misalnya "Kenapa saya didenda?". Jawaban diambil dari catatan keputusan Reeve, lengkap dengan buktinya.`);
     }
     const who = l.chats[chatKey(chat)];
     if (!who) return null;
+    keepChat(who.subject, chat); // a link made before push was on is upgraded by the tenant's next message
     if (who.subject === OWNER_SUBJECT) {
       if (/^\/ringkasan(@\w+)?$/i.test(text) && deps.digest) return reply(await deps.digest());
       const a = await (await ask()).ask(text.slice(0, 300), { role: "owner", channel: "telegram" });
@@ -109,5 +127,5 @@ export function mekoTelegram(deps: MekoTelegramDeps) {
     return reply(a.text.replace(/\nLihat bukti: /, "\n\nLihat bukti: "));
   }
 
-  return { handle, createLink, createOwnerLink, ownerLinked, explainForWhatsApp };
+  return { handle, createLink, createOwnerLink, ownerLinked, explainForWhatsApp, chatFor };
 }
