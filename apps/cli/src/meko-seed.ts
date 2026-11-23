@@ -4,6 +4,8 @@
 //   npm run meko:seed -- --ledger=pg           # ledger in Postgres (DATABASE_URL): what the deployed API reads
 //   npm run meko:seed -- --local --fresh       # rehearsal on local Meko (`meko start`), demo datapack reset
 //   npm run meko:seed -- --llm                 # Worker drafts on Claude Haiku 5.5 (costs a few cents)
+//   npm run meko:seed -- --no-anchor           # no anchor entry (default: a testnet tx when REEVE_ANCHOR_PRIVATE_KEY is set, else a local Merkle root)
+//   REEVE_SANDBOX=createos npm run meko:seed   # the Auditor's planted defects run in a CreateOS microVM (CREATEOS_API_KEY)
 //
 // It checks the endpoint and its tools first, then runs `crew:demo` with the same flags and prints
 // what to set on CreateOS (key names only). Secret values are never printed.
@@ -53,4 +55,8 @@ Done. For the deployed API (CreateOS reeve-api, branch main), set these environm
   REEVE_MEKO_WORKSPACE    only if not "kos-melati"
   TELEGRAM_BOT_USERNAME   bot name for the tenant link (t.me/<name>?start=<code>)
   REEVE_MEKO_PUBLIC_ASK   "on" only if the public Tanya usaha box should accept questions
+For the live billing tick (POST /api/meko/tick; the seed wrote the demo bills):
+  REEVE_TICK_SECRET       long random value for x-reeve-tick-secret (cron callers); without it only the owner session can tick
+  REEVE_MEKO_TICK         "on" runs the tick after start-up and daily at about 08:00 WIB inside the API
+  TELEGRAM_BOT_TOKEN      reminders go to tenants' linked Telegram chats; without it they go to the Log connector (recorded, not sent)
 The API must read the same ledger: seed with --ledger=pg for the deployment.`);
