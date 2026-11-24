@@ -162,7 +162,7 @@ describe("syncJournal", () => {
     const realRun = ws.run.bind(ws);
     let broken = true;
     (ws as { run: typeof ws.run }).run = (id) => {
-      if (broken && id.startsWith("run_journal_")) throw new Error("meko down");
+      if (broken && id?.startsWith("run_journal_")) throw new Error("meko down");
       return realRun(id);
     };
     const { r, calls } = registry();
