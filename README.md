@@ -117,10 +117,12 @@ The seed also writes the five Kos Melati demo tenants' bills into the workspace 
 | `REEVE_MEKO_TICK=on` | In-process scheduler: one tick shortly after start-up (only when it is 08:00 WIB or later and today's tick is not done; a start at night waits for 08:00 WIB), then one every day at about 08:00 WIB, and a minute timer that runs staged reminders once their window has passed. Safe with restarts (per-day idempotency). Without it, call the route from a cron with the secret. **Run one API instance**: the day's claim lives in that process's copy of the store, so two instances ticking the same day would both run it. |
 | `TELEGRAM_BOT_TOKEN` | A reminder that runs is sent with the Bot API `sendMessage` to the tenant's linked Telegram chat and recorded `via: "telegram"`. No token, or the tenant has no linked chat: `via: "log"`. A Telegram error is recorded as a failed run, never as sent. |
 | `REEVE_TICK_SECRET` | Secret for the two routes above (cron, and the owner's "sudah bayar" call). Set it as a long random value; it is never logged. |
+| `REEVE_JOURNAL=on` | Bookkeeping to Google Sheets through Composio (needs `COMPOSIO_API_KEY` with Google Sheets connected). After each tick and each paid mark, plus `POST /api/meko/journal/sync` (same secret), code turns every rent marked paid and every late fee in the ledger into a journal row. The columns are: recorded (WIB), kind, tenant pseudonym, room, due date, amount, note, origin (`live` or `demo (seed)`), receipt hash and proof link. Rows already written are not written again. The first sync creates the sheet "Reeve - Jurnal Kos Melati", unless `REEVE_JOURNAL_SHEET_ID` names one. Each sync that wrote rows is a `journal_sync` decision listing their receipts. A late fee is booked as a receivable, because the tick records it but does not bill it. |
 
 ```bash
 curl -X POST https://<api>/api/meko/tick -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
 curl -X POST https://<api>/api/meko/bills/K05/paid -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
+curl -X POST https://<api>/api/meko/journal/sync -H "x-reeve-tick-secret: $REEVE_TICK_SECRET"
 ```
 
 Rules it follows: the **autonomy ladder** decides. While "Pengingat" is at `ask` (the default) a due reminder is recorded as `ask_owner` and nothing is staged; once the owner moves it up, a reminder is **staged for 10 minutes** (undo in the owner app) and only then sent. A month that starts rolls the bills to its due day (the 1st): nobody has paid yet, no fee charged, tenure one month longer.

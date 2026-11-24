@@ -91,11 +91,13 @@ const mekoOwner = createMekoOwnerApp(
     outbox: { execute: liveExecutor({ token: botToken, chatOf: (subject) => mekoTg.chatFor(subject) }) },
     webOrigin: origin,
     store: mekoStore.store,
+    // Bookkeeping to Google Sheets (T1-5): off unless REEVE_JOURNAL=on; needs COMPOSIO_API_KEY with Google Sheets connected.
+    ...(process.env.REEVE_JOURNAL === "on" ? { journal: { registry: connectorsFromEnv(process.env), spreadsheetId: process.env.REEVE_JOURNAL_SHEET_ID || undefined } } : {}),
   },
   mekoOpen,
 );
 // POST /api/meko/tick and POST /api/meko/bills/:id/paid: the live billing loop. Secret only (x-reeve-tick-secret = REEVE_TICK_SECRET), no session.
-const mekoTick = createMekoTickApp({ tick: mekoOwner.tick, markPaid: mekoOwner.markPaid, secret: process.env.REEVE_TICK_SECRET || undefined });
+const mekoTick = createMekoTickApp({ tick: mekoOwner.tick, markPaid: mekoOwner.markPaid, journal: mekoOwner.syncJournal, secret: process.env.REEVE_TICK_SECRET || undefined });
 
 const { app, openAll } = await createAccountsApp({
   persistence,
@@ -104,6 +106,7 @@ const { app, openAll } = await createAccountsApp({
     // Served without a session; each route checks the tick secret itself.
     { prefix: "/api/meko/tick", fetch: (req) => mekoTick.fetch(req) },
     { prefix: "/api/meko/bills/", fetch: (req) => mekoTick.fetch(req) },
+    { prefix: "/api/meko/journal/", fetch: (req) => mekoTick.fetch(req) },
   ],
   webhookFirst: (req) => (new URL(req.url).pathname === "/api/webhooks/telegram" ? mekoTg.handle(req) : Promise.resolve(null)),
   ownerApps: [{ prefix: "/api/meko/owner/", fetch: (req, account) => mekoOwner.fetch(req, account) }],

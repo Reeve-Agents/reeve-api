@@ -5,6 +5,7 @@ export * from "./validator";
 export * from "./crew";
 export * from "./kamar";
 export * from "./calendar";
+export * from "./jurnal";
 export * from "./konten";
 export * from "./ladder";
 export * from "./tagihan";
