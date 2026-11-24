@@ -1,7 +1,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { demoBills, liveExecutor, loadBillBook, saveBillBook } from "@reeve/crew";
+import { type CalendarRegistry, demoBills, liveExecutor, loadBillBook, saveBillBook } from "@reeve/crew";
 import { FakeMeko } from "@reeve/meko";
 import { Ledger } from "@reeve/receipts";
 import { describe, expect, it, vi } from "vitest";
@@ -14,7 +14,7 @@ import { Store } from "../src/store";
 const SECRET = "tick-secret-for-tests";
 const WIB = (date: string, time = "08:00") => Date.parse(`${date}T${time}:00+07:00`);
 
-async function setup(opts: { secret?: string | null; level?: "auto" | "ask_if_unusual"; token?: string; chats?: Record<string, string>; tick?: () => Promise<never> } = {}) {
+async function setup(opts: { secret?: string | null; level?: "auto" | "ask_if_unusual"; token?: string; chats?: Record<string, string>; tick?: () => Promise<never>; journal?: CalendarRegistry } = {}) {
   const meko = new FakeMeko();
   const ledger = new Ledger(join(mkdtempSync(join(tmpdir(), "meko-tick-")), "ledger.jsonl"));
   const store = new Store(null);
@@ -27,7 +27,7 @@ async function setup(opts: { secret?: string | null; level?: "auto" | "ask_if_un
     return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }), { status: 200 });
   }) as unknown as typeof fetch;
   const open = mekoOpener({ workspace: "kos-melati", ledger, connect: async () => meko });
-  const owner = createMekoOwnerApp({ store, now: () => now, outbox: { execute: liveExecutor({ token: opts.token, chatOf: (s) => opts.chats?.[s] ?? null, fetchFn }) } }, open);
+  const owner = createMekoOwnerApp({ store, now: () => now, ...(opts.journal ? { journal: { registry: opts.journal, spreadsheetId: "sheet-test" } } : {}), outbox: { execute: liveExecutor({ token: opts.token, chatOf: (s) => opts.chats?.[s] ?? null, fetchFn }) } }, open);
   const ticks = createMekoTickApp({ tick: opts.tick ?? owner.tick, markPaid: owner.markPaid, secret: opts.secret === null ? undefined : (opts.secret ?? SECRET) });
   const { app } = await createAccountsApp({
     persistence: filePersistence(mkdtempSync(join(tmpdir(), "meko-tick-acc-"))),
@@ -267,5 +267,64 @@ describe("Telegram chat ids for push", () => {
     expect(tg.chatFor("K08")).toBeNull();
     expect(tg.chatFor("PEMILIK")).toBeNull();
     expect(tg.chatFor("K03")).toBe("9999");
+  });
+});
+
+describe("POST /api/meko/journal/sync", () => {
+  const post = (ticks: ReturnType<typeof createMekoTickApp>, secret?: string) =>
+    ticks.fetch(new Request("http://x/api/meko/journal/sync", { method: "POST", headers: secret ? { "x-reeve-tick-secret": secret } : {} }));
+  const base = { tick: async () => { throw new Error("unused"); }, markPaid: async () => { throw new Error("unused"); }, secret: "s3cret" };
+
+  it("needs the secret, and is 404 when the journal is off", async () => {
+    const on = createMekoTickApp({ ...base, journal: async () => ({ status: "nothing_new", rows: 0, pending: 0, note: "ok" }) });
+    expect((await post(on)).status).toBe(401);
+    expect((await post(on, "wrong")).status).toBe(401);
+    const res = await post(on, "s3cret");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "nothing_new" });
+    expect((await post(createMekoTickApp(base), "s3cret")).status).toBe(404);
+  });
+
+  it("does not leak the internal error", async () => {
+    const res = await post(createMekoTickApp({ ...base, journal: async () => { throw new Error("db host=10.1.1.1"); } }), "s3cret");
+    expect(res.status).toBe(503);
+    expect(JSON.stringify(await res.json())).not.toContain("10.1.1.1");
+  });
+});
+
+describe("journal after a paid mark and a tick", () => {
+  it("writes the paid rent and the tick's fees to the sheet, each once; a sheet failure never fails the call", async () => {
+    const appended: unknown[][] = [];
+    let broken = false;
+    const journal: CalendarRegistry = {
+      list: () => [{ id: "composio", kind: "composio" }],
+      appStatus: async () => ({ googlesheets: 1 }),
+      execute: async (_c, tool, args) => {
+        if (tool === "GOOGLESHEETS_GET_SHEET_NAMES") return { ok: true, connector: "composio", data: { sheet_names: ["Sheet1"] } };
+        if (broken) return { ok: false, error: "quota", connector: "composio" };
+        appended.push(...(args.values as unknown[][]));
+        return { ok: true, connector: "composio", data: {} };
+      },
+    };
+    const h = { "x-reeve-tick-secret": SECRET };
+    const { paid, post, setNow } = await setup({ level: "auto", journal });
+    const p = (await (await paid("K05", h)).json()) as { journal?: { status: string; rows: number } };
+    expect(p.journal).toMatchObject({ status: "synced", rows: 1 });
+    expect(appended.map((r) => `${r[1]}:${r[2]}`)).toEqual(["Sewa diterima:K05"]);
+
+    setNow(WIB("2026-12-09"));
+    broken = true;
+    const t = await post(h);
+    expect(t.status).toBe(200);
+    const tick = (await t.json()) as { journal?: { status: string; pending: number } };
+    expect(tick.journal?.status).toBe("failed");
+    expect(tick.journal?.pending).toBeGreaterThan(0);
+
+    broken = false;
+    const again = (await (await post(h)).json()) as { repeated?: boolean; journal?: { status: string; rows: number } };
+    expect(again.repeated).toBe(true);
+    expect(again.journal?.status).toBe("synced");
+    expect(appended.filter((r) => r[1] === "Denda (piutang)").length).toBe(again.journal!.rows);
+    expect(new Set(appended.map((r) => r[8])).size).toBe(appended.length);
   });
 });

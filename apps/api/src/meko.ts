@@ -2,11 +2,14 @@
 // decision", verification and the Rapor Usaha. Only pseudonymised data lives there, so it is served
 // without a session at /api/meko/public/*. Writing (seeding, storing a report) is the CLI's job.
 import type { Rulebook } from "@reeve/core";
-import { amendmentsEnabled, buildDigest, liveTick, markBillPaid, type MarkPaidResult, NoBills, type TickReport, UnknownBill, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, type AskLlm, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
+import { type CalendarRegistry, type JournalSyncResult, syncJournal, amendmentsEnabled, buildDigest, liveTick, markBillPaid, type MarkPaidResult, NoBills, type TickReport, UnknownBill, dryRun, type DigestSender, loadOutbox, Outbox, sendDigest, UNDO_WINDOW_MS, UndoRefused, wibDate, type ExecResult, type AskLlm, AskBusiness, approveAmendment, buildRapor, type History, loadAmendments, loadExceptions, localShortfalls, rejectAmendment, scanAmendments, verifyWeak, weakSearches, SHORTFALL_MIN, DEFAULT_POLICIES, type DiscoveryAudit, type DiscoveryState, kosDiscoverySample, KOS_FACTS, Ladder, listShares, loadLadderState, loadReview, paymentsFromRows, revokeShare, shareRapor, sharedRapor, parsePaymentsCsv, raporHtml, SopDiscovery, stepOf, validate } from "@reeve/crew";
 import { type MekoMessage, type MekoTransport, MekoWorkspace, Pseudonymiser, verifyDecision } from "@reeve/meko";
 import type { Ledger } from "@reeve/receipts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
+
+/** How long a tick or paid mark waits for the journal sync before returning without it. */
+const JOURNAL_WAIT_MS = 8_000;
 
 export interface MekoAppDeps {
   workspace: string;
@@ -128,6 +131,8 @@ export interface MekoOwnerDeps {
   outbox?: { execute?: (tool: string, args: Record<string, unknown>) => Promise<ExecResult> };
   /** Where the daily digest goes. Default: dry run (text only). Live Telegram needs TELEGRAM_BOT_TOKEN + REEVE_DIGEST=on. */
   digest?: { sender?: DigestSender };
+  /** Bookkeeping to Google Sheets through Composio (REEVE_JOURNAL=on). Synced after each tick and paid mark, and on POST /api/meko/journal/sync. */
+  journal?: { registry: CalendarRegistry | null; spreadsheetId?: string };
   now?: () => number;
 }
 
@@ -430,18 +435,55 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
       }
     });
 
+  // Bookkeeping: one sync at a time (a second caller waits for the first), so no row is appended twice.
+  let journaling: Promise<unknown> = Promise.resolve();
+  const syncJournalNow = (): Promise<JournalSyncResult | undefined> => {
+    const j = deps.journal;
+    if (!j) return Promise.resolve(undefined);
+    const origin = (deps.webOrigin ?? "").replace(/\/$/, "");
+    const run = journaling.then(async () => syncJournal({ ws: await open(), store: needStore(), registry: j.registry, spreadsheetId: j.spreadsheetId, proofUrl: (r) => `${origin}/?view=jejak&receipt=${r}`, now: clock }));
+    journaling = run.catch(() => undefined);
+    return run;
+  };
+  /**
+   * After a tick or a paid mark the journal is synced too. A journal failure never fails the tick, and a slow
+   * Google Sheets call never holds it: after JOURNAL_WAIT_MS the sync goes on in the background and logs its result.
+   */
+  const logJournal = (j: JournalSyncResult | undefined) => {
+    if (j && (j.status === "failed" || j.status === "unavailable")) console.error(`meko journal ${j.status}: ${j.note}`);
+  };
+  const withJournal = async <T extends object>(result: T): Promise<T & { journal?: JournalSyncResult | { status: "failed" | "pending"; note: string } }> => {
+    if (!deps.journal) return result;
+    try {
+      const run = syncJournalNow();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<"late">((ok) => (timer = setTimeout(() => ok("late"), JOURNAL_WAIT_MS)));
+      const journal = await Promise.race([run, late]).finally(() => clearTimeout(timer));
+      if (journal === "late") {
+        run.then(logJournal, (e) => console.error(`meko journal sync failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`));
+        return { ...result, journal: { status: "pending" as const, note: "Jurnal masih disinkronkan di latar; hasilnya ada di log server." } };
+      }
+      logJournal(journal);
+      return journal ? { ...result, journal } : result;
+    } catch (e) {
+      console.error(`meko journal sync failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
+      return { ...result, journal: { status: "failed", note: "Jurnal gagal disinkronkan; rinciannya ada di log server." } };
+    }
+  };
+
   // The live billing loop: today's tick over the stored bills (liveTick). One at a time; a second caller shares the run.
   let ticking: Promise<TickReport> | null = null;
   const tick = (): Promise<TickReport> => {
-    ticking ??= (async () => liveTick({ ws: await open(), store: needStore(), ladder: await getLadder(), outbox: await getOutbox(), execute: logExec, now: clock }))().finally(() => (ticking = null));
+    ticking ??= (async () => withJournal(await liveTick({ ws: await open(), store: needStore(), ladder: await getLadder(), outbox: await getOutbox(), execute: logExec, now: clock })))().finally(() => (ticking = null));
     return ticking;
   };
 
   /** The owner records that a tenant paid this month (POST /api/meko/bills/:id/paid): the bill leaves the loop, the decision is traced. */
-  const markPaid = async (id: string, who: string): Promise<MarkPaidResult> => markBillPaid({ ws: await open(), store: needStore(), outbox: await getOutbox(), now: clock }, id, who);
+  const markPaid = async (id: string, who: string): Promise<MarkPaidResult> => withJournal(await markBillPaid({ ws: await open(), store: needStore(), outbox: await getOutbox(), now: clock }, id, who));
 
   return {
     app,
+    syncJournal: syncJournalNow,
     fetch: (req: Request, account: string) => app.fetch(req, { account }),
     /** Digest text for today, for the owner's /ringkasan on Telegram. */
     digestText: async () => (await digestFor()).text,
@@ -467,13 +509,13 @@ const sha = (v: string) => createHash("sha256").update(v).digest();
  * - POST /api/meko/bills/:id/paid: records that tenant :id (K05) paid this month.
  * Served without a session, as `fetch(req)`.
  */
-export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; markPaid: (id: string, by: string) => Promise<MarkPaidResult>; secret?: string }) {
+export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; markPaid: (id: string, by: string) => Promise<MarkPaidResult>; journal?: () => Promise<JournalSyncResult | undefined>; secret?: string }) {
   const app = new Hono().basePath("/api/meko");
   const allowed = (header: string | undefined) => !!deps.secret && !!header && timingSafeEqual(sha(header), sha(deps.secret));
   const denied = { error: "Kirim header x-reeve-tick-secret yang benar." };
   const generic = (what: string, e: unknown) => {
     console.error(`meko ${what} failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
-    return { error: `${what === "tick" ? "Tick" : "Menandai lunas"} gagal dijalankan. Coba lagi sebentar lagi; rinciannya ada di log server.` };
+    return { error: `${what === "tick" ? "Tick" : what === "journal" ? "Sinkron jurnal" : "Menandai lunas"} gagal dijalankan. Coba lagi sebentar lagi; rinciannya ada di log server.` };
   };
   app.post("/tick", async (c) => {
     if (!allowed(c.req.header("x-reeve-tick-secret"))) return c.json(denied, 401);
@@ -494,6 +536,15 @@ export function createMekoTickApp(deps: { tick: () => Promise<TickReport>; markP
       if (e instanceof NoBills) return c.json({ error: e.message }, 409);
       if (e instanceof UnknownBill) return c.json({ error: e.message }, 404);
       return c.json(generic("mark paid", e), 503);
+    }
+  });
+  app.post("/journal/sync", async (c) => {
+    if (!allowed(c.req.header("x-reeve-tick-secret"))) return c.json(denied, 401);
+    try {
+      const r = await deps.journal?.();
+      return r ? c.json(r) : c.json({ error: "Jurnal Google Sheets belum dinyalakan di server ini (REEVE_JOURNAL=on)." }, 404);
+    } catch (e) {
+      return c.json(generic("journal", e), 503);
     }
   });
   return { app, fetch: (req: Request) => app.fetch(req) };
