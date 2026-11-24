@@ -121,9 +121,65 @@ describe("syncJournal", () => {
     expect(loadJournal(st.data)).toMatchObject({ spreadsheet_id: "sheet-123", needs_header: true });
     const ok = registry();
     await syncJournal({ ws, store: st, registry: ok.r });
-    expect(ok.calls.map((c) => c.tool)).toEqual([SHEETS_APPEND_TOOL]);
-    expect((ok.calls[0]!.args.values as unknown[][])[0]).toEqual(JOURNAL_HEADER);
+    expect(ok.calls.map((c) => c.tool)).toEqual([SHEETS_NAMES_TOOL, SHEETS_APPEND_TOOL]);
+    expect((ok.calls[1]!.args.values as unknown[][])[0]).toEqual(JOURNAL_HEADER);
     expect(loadJournal(st.data).needs_header).toBeUndefined();
+  });
+
+  it("reads no conversation for rows already synced, and skips one it cannot read", async () => {
+    const ws = await seeded();
+    const st = store();
+    await syncJournal({ ws, store: st, registry: registry().r });
+    const real = ws.conversation.bind(ws);
+    let reads = 0;
+    (ws as { conversation: typeof ws.conversation }).conversation = async (a, id) => (reads++, real(a, id));
+    expect((await syncJournal({ ws, store: st, registry: registry().r })).status).toBe("nothing_new");
+    expect(reads).toBe(0);
+
+    const fresh = await seeded();
+    const broken = fresh.decisions().find((d) => d.action === "charge_fee")!.conversation_id;
+    const realF = fresh.conversation.bind(fresh);
+    (fresh as { conversation: typeof fresh.conversation }).conversation = async (a, id) => {
+      if (id === broken) throw new Error("404 conversation gone");
+      return realF(a, id);
+    };
+    expect((await journalRows(fresh)).map((r) => r.kind)).toEqual(["rent_received"]);
+  });
+
+  it("reads the tab name again after an append fails, so a renamed tab heals", async () => {
+    const ws = await seeded();
+    const st = store();
+    await syncJournal({ ws, store: st, registry: registry({ fail: SHEETS_APPEND_TOOL }).r, spreadsheetId: "s" });
+    expect(loadJournal(st.data).sheet_name).toBeUndefined();
+    const ok = registry();
+    await syncJournal({ ws, store: st, registry: ok.r, spreadsheetId: "s" });
+    expect(ok.calls.map((c) => c.tool)).toEqual([SHEETS_NAMES_TOOL, SHEETS_APPEND_TOOL]);
+  });
+
+  it("keeps rows written when the decision fails, and records it on the next sync", async () => {
+    const ws = await seeded();
+    const st = store();
+    const realRun = ws.run.bind(ws);
+    let broken = true;
+    (ws as { run: typeof ws.run }).run = (id) => {
+      if (broken && id.startsWith("run_journal_")) throw new Error("meko down");
+      return realRun(id);
+    };
+    const { r, calls } = registry();
+    const first = await syncJournal({ ws, store: st, registry: r });
+    expect(first).toMatchObject({ status: "synced", rows: 2 });
+    expect(first.receipt).toBeUndefined();
+    expect(first.note).toMatch(/Jejaknya belum tercatat/);
+    expect(loadJournal(st.data).untraced).toHaveLength(2);
+    broken = false;
+    const second = await syncJournal({ ws, store: st, registry: r });
+    expect(second).toMatchObject({ status: "synced", rows: 0 });
+    expect(second.receipt).toBeDefined();
+    expect(calls.filter((c) => c.tool === SHEETS_APPEND_TOOL)).toHaveLength(1);
+    const d = ws.decisions().filter((x) => x.action === "journal_sync");
+    expect(d).toHaveLength(1);
+    expect(loadJournal(st.data).untraced).toBeUndefined();
+    expect((await syncJournal({ ws, store: st, registry: r })).status).toBe("nothing_new");
   });
 
   it("quotes tab names", () => {

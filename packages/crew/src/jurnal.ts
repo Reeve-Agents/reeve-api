@@ -43,6 +43,8 @@ export interface JournalState {
   needs_header?: boolean;
   /** Receipts already written to the sheet. */
   synced: string[];
+  /** Receipts written to the sheet whose `journal_sync` decision is not recorded yet; the next sync records it. */
+  untraced?: string[];
   last_sync?: string;
 }
 
@@ -66,13 +68,26 @@ function parse(s: string | undefined): Record<string, unknown> {
   }
 }
 
-/** One journal row per rent marked paid and per late fee, oldest first, read from the ledger and the Meko trace. */
-export async function journalRows(ws: MekoWorkspace, proofUrl: (receipt: string) => string = (r) => `/?view=jejak&receipt=${r}`): Promise<JournalRow[]> {
-  const wanted = ws.decisions().filter((d) => d.action === "mark_paid" || d.action === "charge_fee");
+/**
+ * One journal row per rent marked paid and per late fee, oldest first, read from the ledger and the Meko trace.
+ * Receipts in `skip` are left out before any conversation is read, so a sync's cost follows the new rows,
+ * not the whole history. A conversation that cannot be read is skipped; its rows come back once it can be.
+ */
+export async function journalRows(ws: MekoWorkspace, proofUrl: (receipt: string) => string = (r) => `/?view=jejak&receipt=${r}`, skip: ReadonlySet<string> = new Set()): Promise<JournalRow[]> {
+  const wanted = ws.decisions().filter((d) => (d.action === "mark_paid" || d.action === "charge_fee") && !skip.has(d.entry_hash));
   const convs = new Map<string, string>();
   for (const d of wanted) if (!convs.has(d.conversation_id)) convs.set(d.conversation_id, d.agent);
   const byReceipt = new Map<string, MekoMessage>();
-  for (const [id, agent] of convs) for (const m of (await ws.conversation(agent, id)).messages) if (typeof m.metadata?.reeve_receipt === "string") byReceipt.set(m.metadata.reeve_receipt, m);
+  for (const [id, agent] of convs) {
+    let messages: MekoMessage[];
+    try {
+      messages = (await ws.conversation(agent, id)).messages;
+    } catch (e) {
+      console.error(`journal: conversation ${id} unreadable, its rows wait: ${oneLine(e)}`);
+      continue;
+    }
+    for (const m of messages) if (typeof m.metadata?.reeve_receipt === "string") byReceipt.set(m.metadata.reeve_receipt, m);
+  }
   const rows: JournalRow[] = [];
   for (const d of wanted) {
     const m = byReceipt.get(d.entry_hash);
@@ -138,7 +153,13 @@ export function appendedRange(data: unknown): string | undefined {
   return undefined;
 }
 
-const oneLine = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/ck_[A-Za-z0-9_-]+/g, "[key]").replace(/\s+/g, " ").slice(0, 200);
+/** An error as one short line, with keys and long ids (a spreadsheet id, for one) masked. */
+const oneLine = (e: unknown) =>
+  (e instanceof Error ? e.message : String(e))
+    .replace(/\b(?:ck|ak|sk)_[A-Za-z0-9_-]+/g, "[key]")
+    .replace(/[A-Za-z0-9_-]{25,}/g, "[id]")
+    .replace(/\s+/g, " ")
+    .slice(0, 200);
 
 export interface JournalSyncResult {
   status: "synced" | "nothing_new" | "unavailable" | "failed";
@@ -169,8 +190,19 @@ export interface JournalSyncDeps {
 export async function syncJournal(deps: JournalSyncDeps): Promise<JournalSyncResult> {
   const state = loadJournal(deps.store.data);
   const done = new Set(state.synced);
-  const fresh = (await journalRows(deps.ws, deps.proofUrl)).filter((r) => !done.has(r.receipt));
-  if (fresh.length === 0) return { status: "nothing_new", rows: 0, pending: 0, note: "Jurnal sudah lengkap: tidak ada baris baru." };
+  const owedSet = new Set(state.untraced ?? []);
+  const rows = await journalRows(deps.ws, deps.proofUrl, new Set([...done].filter((r) => !owedSet.has(r))));
+  const fresh = rows.filter((r) => !done.has(r.receipt));
+  const owed = rows.filter((r) => owedSet.has(r.receipt));
+  if (fresh.length === 0) {
+    if (owed.length === 0) return { status: "nothing_new", rows: 0, pending: 0, note: "Jurnal sudah lengkap: tidak ada baris baru." };
+    try {
+      const receipt = await traceSync(deps, state, owed, {});
+      return { status: "synced", rows: 0, receipt, pending: 0, note: `Jejak untuk ${owed.length} baris jurnal yang sudah ditulis kini tercatat.` };
+    } catch (e) {
+      return { status: "failed", rows: 0, pending: 0, note: `Baris jurnal sudah di Google Sheets, tetapi jejaknya belum tercatat: ${oneLine(e)}. Dicoba lagi pada sinkron berikutnya.` };
+    }
+  }
   const registry = deps.registry;
   const why = await unavailable(registry);
   if (why || !registry) return { status: "unavailable", rows: 0, pending: fresh.length, note: `Jurnal belum ditulis: ${why}.` };
@@ -183,11 +215,13 @@ export async function syncJournal(deps: JournalSyncDeps): Promise<JournalSyncRes
     delete state.needs_header;
   }
   let created = false;
+  let r: Awaited<ReturnType<CalendarRegistry["execute"]>>;
+  const batch = fresh.slice(0, BATCH);
   try {
     if (!state.spreadsheet_id) {
-      const r = await registry.execute("composio", SHEETS_CREATE_TOOL, { title: JOURNAL_TITLE });
-      if (!r.ok) return fail(r.error ?? "membuat spreadsheet gagal");
-      const id = field(r.data, "spreadsheetId", "spreadsheet_id", "id");
+      const c = await registry.execute("composio", SHEETS_CREATE_TOOL, { title: JOURNAL_TITLE });
+      if (!c.ok) return fail(c.error ?? "membuat spreadsheet gagal");
+      const id = field(c.data, "spreadsheetId", "spreadsheet_id", "id");
       if (!id) return fail("Composio tidak mengembalikan id spreadsheet");
       state.spreadsheet_id = id;
       state.needs_header = true;
@@ -196,37 +230,60 @@ export async function syncJournal(deps: JournalSyncDeps): Promise<JournalSyncRes
     }
     const sheet = state.spreadsheet_id;
     if (!state.sheet_name) {
-      const r = await registry.execute("composio", SHEETS_NAMES_TOOL, { spreadsheet_id: sheet });
-      const name = r.ok ? firstSheetName(r.data) : undefined;
-      if (!name) return fail(r.error ?? "nama tab spreadsheet tidak terbaca");
+      const n = await registry.execute("composio", SHEETS_NAMES_TOOL, { spreadsheet_id: sheet });
+      const name = n.ok ? firstSheetName(n.data) : undefined;
+      if (!name) return fail(n.error ?? "nama tab spreadsheet tidak terbaca");
       state.sheet_name = name;
       deps.store.save();
     }
-    const batch = fresh.slice(0, BATCH);
     const header = state.needs_header === true;
     const values = [...(header ? [JOURNAL_HEADER] : []), ...batch.map(sheetValues)];
-    const r = await registry.execute("composio", SHEETS_APPEND_TOOL, { spreadsheetId: sheet, range: tabRange(state.sheet_name), valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", majorDimension: "ROWS", values });
-    if (!r.ok) return fail(r.error ?? "append gagal");
-    const range = appendedRange(r.data);
-    const at = deps.now?.() ?? Date.now();
-    state.synced.push(...batch.map((b) => b.receipt));
-    state.last_sync = new Date(at).toISOString();
-    delete state.needs_header;
-    deps.store.save();
-    const op = await deps.ws.run(`run_journal_${Date.now().toString(36)}`).agent("operator", "Jurnal Google Sheets");
-    const totals = (k: JournalRow["kind"]) => batch.filter((b) => b.kind === k).reduce((s, b) => s + b.amount_idr, 0);
-    const d = await op.decide({
-      input: `${batch.length} baris jurnal baru dari ledger (${batch.filter((b) => b.kind === "rent_received").length} sewa diterima, ${batch.filter((b) => b.kind === "late_fee").length} denda)`,
-      output: { action: "journal_sync", via: r.connector, rows: batch.length, receipts: batch.map((b) => b.receipt), rent_received_idr: totals("rent_received"), late_fee_idr: totals("late_fee"), ...(range ? { range } : {}), ...(created ? { created_sheet: true } : {}) },
-      reasoning: `Code built ${batch.length} journal row(s) from the ledger (rent the owner marked paid, late fees the tick recorded) and appended them to the owner's Google Sheet through Composio; each row carries its receipt hash and proof link. No model was used. The spreadsheet id is kept in the workspace store, not in this receipt.`,
-      action: "journal_sync",
-      action_class: "bookkeeping",
-    });
-    const pending = fresh.length - batch.length;
-    return { status: "synced", rows: batch.length, receipt: d.receipt_hash, pending, ...(created ? { created_sheet: true } : {}), note: `${batch.length} baris jurnal ditulis ke Google Sheets${created ? ` (spreadsheet baru "${JOURNAL_TITLE}")` : ""}.${pending ? ` ${pending} baris lagi pada sinkron berikutnya.` : ""}` };
+    r = await registry.execute("composio", SHEETS_APPEND_TOOL, { spreadsheetId: sheet, range: tabRange(state.sheet_name), valueInputOption: "RAW", insertDataOption: "INSERT_ROWS", majorDimension: "ROWS", values });
+    if (!r.ok) throw new Error(r.error ?? "append gagal");
   } catch (e) {
+    // The tab may have been renamed or removed: read its name again next time.
+    if (state.sheet_name) {
+      delete state.sheet_name;
+      deps.store.save();
+    }
     return fail(e);
   }
+  // Written: mark the rows synced first, so they are never appended twice, and owe their decision until it is recorded.
+  state.synced.push(...batch.map((b) => b.receipt));
+  state.untraced = [...(state.untraced ?? []), ...batch.map((b) => b.receipt)];
+  state.last_sync = new Date(deps.now?.() ?? Date.now()).toISOString();
+  delete state.needs_header;
+  deps.store.save();
+  const pending = fresh.length - batch.length;
+  const base = { status: "synced" as const, rows: batch.length, pending, ...(created ? { created_sheet: true } : {}) };
+  const note = `${batch.length} baris jurnal ditulis ke Google Sheets${created ? ` (spreadsheet baru "${JOURNAL_TITLE}")` : ""}.${pending ? ` ${pending} baris lagi pada sinkron berikutnya.` : ""}`;
+  try {
+    const receipt = await traceSync(deps, state, [...owed, ...batch], { via: r.connector, range: appendedRange(r.data), created });
+    return { ...base, receipt, note };
+  } catch (e) {
+    console.error(`journal: rows written, decision not recorded yet: ${oneLine(e)}`);
+    return { ...base, note: `${note} Jejaknya belum tercatat; dicoba lagi pada sinkron berikutnya.` };
+  }
+}
+
+/** Records one `journal_sync` decision for rows already in the sheet, then clears them from `untraced`. */
+async function traceSync(deps: JournalSyncDeps, state: JournalState, rows: JournalRow[], at: { via?: string; range?: string; created?: boolean }): Promise<string> {
+  const op = await deps.ws.run(`run_journal_${Date.now().toString(36)}`).agent("operator", "Jurnal Google Sheets");
+  const count = (k: JournalRow["kind"]) => rows.filter((b) => b.kind === k).length;
+  const totals = (k: JournalRow["kind"]) => rows.filter((b) => b.kind === k).reduce((s, b) => s + b.amount_idr, 0);
+  const d = await op.decide({
+    input: `${rows.length} baris jurnal dari ledger ditulis ke Google Sheets (${count("rent_received")} sewa diterima, ${count("late_fee")} denda)`,
+    output: { action: "journal_sync", ...(at.via ? { via: at.via } : {}), rows: rows.length, receipts: rows.map((b) => b.receipt), rent_received_idr: totals("rent_received"), late_fee_idr: totals("late_fee"), ...(at.range ? { range: at.range } : {}), ...(at.created ? { created_sheet: true } : {}) },
+    reasoning: `Code built ${rows.length} journal row(s) from the ledger (rent the owner marked paid, late fees the tick recorded) and appended them to the owner's Google Sheet through Composio; each row carries its receipt hash and proof link. No model was used. The spreadsheet id is kept in the workspace store, not in this receipt.`,
+    action: "journal_sync",
+    action_class: "bookkeeping",
+  });
+  const traced = new Set(rows.map((b) => b.receipt));
+  const left = (state.untraced ?? []).filter((x) => !traced.has(x));
+  if (left.length) state.untraced = left;
+  else delete state.untraced;
+  deps.store.save();
+  return d.receipt_hash;
 }
 
 /** Why Google Sheets cannot be used right now, or null when it can. */

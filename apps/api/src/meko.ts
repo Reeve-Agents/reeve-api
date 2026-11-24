@@ -8,6 +8,9 @@ import type { Ledger } from "@reeve/receipts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 
+/** How long a tick or paid mark waits for the journal sync before returning without it. */
+const JOURNAL_WAIT_MS = 8_000;
+
 export interface MekoAppDeps {
   workspace: string;
   ledger: Ledger;
@@ -442,11 +445,25 @@ export function createMekoOwnerApp(deps: MekoOwnerDeps, open: () => Promise<Meko
     journaling = run.catch(() => undefined);
     return run;
   };
-  /** After a tick or a paid mark the journal is synced too; a journal failure never fails the tick. */
-  const withJournal = async <T extends object>(result: T): Promise<T & { journal?: JournalSyncResult | { status: "failed"; note: string } }> => {
+  /**
+   * After a tick or a paid mark the journal is synced too. A journal failure never fails the tick, and a slow
+   * Google Sheets call never holds it: after JOURNAL_WAIT_MS the sync goes on in the background and logs its result.
+   */
+  const logJournal = (j: JournalSyncResult | undefined) => {
+    if (j && (j.status === "failed" || j.status === "unavailable")) console.error(`meko journal ${j.status}: ${j.note}`);
+  };
+  const withJournal = async <T extends object>(result: T): Promise<T & { journal?: JournalSyncResult | { status: "failed" | "pending"; note: string } }> => {
     if (!deps.journal) return result;
     try {
-      const journal = await syncJournalNow();
+      const run = syncJournalNow();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<"late">((ok) => (timer = setTimeout(() => ok("late"), JOURNAL_WAIT_MS)));
+      const journal = await Promise.race([run, late]).finally(() => clearTimeout(timer));
+      if (journal === "late") {
+        run.then(logJournal, (e) => console.error(`meko journal sync failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`));
+        return { ...result, journal: { status: "pending" as const, note: "Jurnal masih disinkronkan di latar; hasilnya ada di log server." } };
+      }
+      logJournal(journal);
       return journal ? { ...result, journal } : result;
     } catch (e) {
       console.error(`meko journal sync failed: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
